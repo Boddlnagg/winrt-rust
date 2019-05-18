@@ -5,7 +5,9 @@ use std::io::Write;
 
 use climeta::{Cache, Database};
 
-mod generator;
+pub(crate) mod generator;
+pub(crate) mod types;
+
 use generator::Generator;
 
 type Result<T> = std::result::Result<T, Box<Error>>;
