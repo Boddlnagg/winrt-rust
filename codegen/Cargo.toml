@@ -1,0 +1,8 @@
+[package]
+name = "winrt-codegen"
+version = "0.1.0"
+authors = ["Patrick Reisert"]
+edition = "2018"
+
+[dependencies]
+climeta = "0.2"
