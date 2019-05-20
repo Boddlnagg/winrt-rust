@@ -63,8 +63,8 @@ impl<'db> Generator<'db> {
 
                 let typedef = match t.type_category()? {
                     TypeCategory::Enum => TyDef::prepare_enum(t),
+                    TypeCategory::Struct => TyDef::prepare_struct(t),
                     TypeCategory::Interface => TyDef::dummy(),
-                    TypeCategory::Struct => TyDef::dummy(),
                     TypeCategory::Delegate => TyDef::dummy(),
                     TypeCategory::Class => TyDef::dummy()
                 }?;
@@ -81,16 +81,6 @@ impl<'db> Generator<'db> {
 
         let mut modules_vec: Vec<_> = modules.into_iter().map(|(k, v)| Module { namespace: k, assembly_idx: v, depth: k.bytes().filter(|b| *b == b'.').count() as u32 }).collect();
         modules_vec.sort_by_key(|m| m.namespace);
-
-        // let mut files_vec = Vec::new();
-        // let mut prev_idx: Option<Option<u32>> = None;
-        // for m in modules_vec {
-        //     if prev_idx != Some(m.assembly_idx) {
-        //         println!("Module file {} ({:?})", m.namespace, m.assembly_idx);
-        //         files_vec.push(m);
-        //     }
-        //     prev_idx = Some(m.assembly_idx);
-        // }
 
         Ok(Generator {
             cache,
@@ -149,7 +139,7 @@ impl<'db> Generator<'db> {
     }
 
     fn write_module_tree_multifile(&self, idx: &mut usize, definitions: &mut Vec<(FullName<'db>, TyDef<'db>)>, directory: &Path, parent_file: &mut File, parent_module: Option<&Module<'db>>) -> Result<()> {
-        let mut initial_depth = self.modules[*idx].depth;
+        let initial_depth = self.modules[*idx].depth;
         let mut current_directory = Cow::from(directory);
         let mut owned_file = None;
         let mut current_file = parent_file;
@@ -180,7 +170,7 @@ impl<'db> Generator<'db> {
                 &m.namespace
             };
 
-            let module_name = module_name.to_lowercase(); // TODO: correct PascalCase -> snake_case conversion?
+            let module_name = module_name.to_ascii_lowercase(); // TODO: correct PascalCase -> snake_case conversion?
 
             let new_dir = match parent_module {
                 Some(pm) if pm.assembly_idx == m.assembly_idx => None, // same assembly as parent
@@ -189,7 +179,7 @@ impl<'db> Generator<'db> {
 
             if let Some(new_dir) = new_dir {
                 DirBuilder::new().recursive(true).create(directory)?;
-                let mut new_path = directory.join(new_dir.to_lowercase());
+                let mut new_path = directory.join(new_dir.to_ascii_lowercase());
                 new_path.set_extension("rs");
 
                 writeln!(current_file, "pub mod {}; // {}", module_name, m.namespace)?;
@@ -231,7 +221,6 @@ pub fn prevent_keywords(name: &str) -> Cow<str> {
         "move"  |
         "async" |
         "await" |
-        "type"  |
         "const" => {
             let mut s = String::from(name);
             s.push('_');

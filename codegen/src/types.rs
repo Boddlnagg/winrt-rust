@@ -1,6 +1,7 @@
 use std::io::Write;
 
-use climeta::schema::{TypeDef, Type, PrimitiveType, FieldInit, PrimitiveValue};
+use climeta::ResolveToTypeDef;
+use climeta::schema::{TypeDef, Type, TypeTag, PrimitiveType, FieldInit, PrimitiveValue};
 
 use crate::Result;
 use crate::generator::prevent_keywords;
@@ -20,25 +21,48 @@ impl<'db> TypeDefExt<'db> for TypeDef<'db> {
     }
 }
 
+pub struct Dependencies {} // TODO
+
 #[derive(Debug)]
 pub enum TyDef<'db> {
     Enum(TypeDef<'db>),
+    Struct(TypeDef<'db>, String),
     Dummy
 }
 
 impl<'db> TyDef<'db> {
     pub fn prepare_enum(ty: TypeDef<'db>) -> Result<TyDef<'db>> {
-        //println!("Type: {:?}", ty);
         Ok(TyDef::Enum(ty))
     }
 
-    pub fn collect_dependencies(&mut self) -> Result<()> {
+    pub fn prepare_struct(ty: TypeDef<'db>) -> Result<TyDef<'db>> {
+        Ok(TyDef::Struct(ty, String::new()))
+    }
+
+    pub fn can_be_skipped(&self) -> bool {
+        match self {
+            TyDef::Enum(_) => false,
+            TyDef::Struct(td, _) => td.field_list().unwrap().next().is_none(),
+            TyDef::Dummy => true
+        }
+    }
+
+    pub fn collect_dependencies(&mut self) -> Result<Dependencies> {
         match self {
             TyDef::Enum(_) => { /* Nothing to do */ },
+            TyDef::Struct(td, ref mut prepared) => {
+                let result = itertools::join(td.field_list()?.map(|f| {
+                    format!("{}: {}",
+                        prevent_keywords(f.name().expect("can't decode struct field name")),
+                        get_type_name(f.signature().expect("can't decode struct field signature").type_(), TypeUsage::Raw).expect("can't get struct field type name"))
+                }), ", ");
+
+                std::mem::replace(prepared, result);
+            },
             TyDef::Dummy => {}
         }
 
-        Ok(())
+        Ok(Dependencies {})
     }
 
     pub fn emit(&self, file: &mut std::fs::File) -> Result<()> {
@@ -70,6 +94,12 @@ impl<'db> TyDef<'db> {
                 }
                 writeln!(file, "\n}}}}")?;
             },
+            TyDef::Struct(td, prepared) => {
+                // TODO: derive(Eq) whenever possible?
+                writeln!(file, "\nRT_STRUCT! {{ struct {0} {{", td.definition_name()?)?;
+                writeln!(file, "    {}", prepared)?;
+                writeln!(file, "\n}}}}")?;
+            },
             TyDef::Dummy => {}
         }
         Ok(())
@@ -78,15 +108,6 @@ impl<'db> TyDef<'db> {
     pub fn dummy() -> Result<TyDef<'db>> {
         Ok(TyDef::Dummy)
     }
-    
-    pub fn can_be_skipped(&self) -> bool {
-        false
-    }
-}
-
-pub trait TypeRequestSource {
-    fn get_module();
-    fn add_dependency(t: &mut TyDef);
 }
 
 pub enum TypeUsage {
@@ -117,11 +138,26 @@ pub fn get_type_name_primitive(ty: PrimitiveType, usage: TypeUsage) -> Result<St
     })
 }
 
-pub fn get_type_name<T: TypeRequestSource>(source: &T, ty: Type, usage: TypeUsage) -> Result<String> {
+pub fn get_type_name(ty: &Type, usage: TypeUsage) -> Result<String> {
     Ok(match ty {
-        Type::Primitive(prim) => get_type_name_primitive(prim, usage)?,
+        Type::Primitive(prim) => get_type_name_primitive(*prim, usage)?,
         Type::Array(array) => unimplemented!(),
-        Type::Ref(tag, def_or_ref, generic_args) => unimplemented!(),
+        Type::Ref(tag, def_or_ref, generic_args) => if *tag == TypeTag::ValueType {
+            let fullname = def_or_ref.namespace_name_pair();
+            if fullname == ("System", "Guid") {
+                "Guid".into()
+            } else {
+                let mut path = format!("crate::{}::", fullname.0);
+                let mut path = path.replace(".", "::");
+                path.make_ascii_lowercase();
+                path.push_str(fullname.1);
+                path
+            }
+        } else {
+            let fullname = def_or_ref.namespace_name_pair();
+            //panic!("Unimplemented handling for {:?}", fullname);
+            format!("[WIP]{:?}", fullname)
+        },
         Type::GenericVar(scope, idx) => unimplemented!(),
         Type::Object => {
             match usage {
