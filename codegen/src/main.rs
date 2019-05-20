@@ -1,6 +1,6 @@
 use std::error::Error;
-use std::path::{Path, PathBuf};
-use std::fs::{self, File, DirBuilder};
+use std::path::Path;
+use std::fs::{self, DirBuilder};
 use std::io::Write;
 
 use climeta::{Cache, Database};
@@ -29,10 +29,9 @@ fn main() -> Result<()> {
     }
 
     let mut generator = Generator::new(&cache)?;
-    //generator.collect_dependencies();
+    generator.collect_dependencies()?;
     //PrintStatistics(generator.AllTypes);
     //PrintDependencyStatistics(generator.AllTypes);
-    //generator.EmitTypes();
     //int pinterfaceCount = generator.EmitParametricInstances();
     //println!("Found and generated IIDs for {} distinct generic instances.", pinterfaceCount);
 

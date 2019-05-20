@@ -28,6 +28,18 @@ pub struct Generator<'db> {
 
 type ModuleMap<'db> = HashMap<&'db str, Option<u32>>;
 
+fn next_from_namespace<'db>(definitions: &mut Vec<(FullName<'db>, TyDef<'db>)>, namespace: &str) -> Option<(FullName<'db>, TyDef<'db>)> {
+    if let Some(last) = definitions.last() {
+        if (last.0).0 == namespace {
+            definitions.pop()
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
 impl<'db> Generator<'db> {
     pub fn new(cache: &'db Cache<'db>) -> Result<Generator<'db>> {
         let mut all_definitions = HashMap::new();
@@ -57,7 +69,7 @@ impl<'db> Generator<'db> {
                     TypeCategory::Class => TyDef::dummy()
                 }?;
 
-                if typedef.can_be_skipped() {
+                if !typedef.can_be_skipped() {
                     all_definitions.insert(fullname, typedef);
                 }
             }
@@ -110,7 +122,20 @@ impl<'db> Generator<'db> {
         }
     }
 
-    pub fn write_module_tree_multifile_root(&self, directory: &Path) -> Result<()> {
+    pub fn collect_dependencies(&mut self ) -> Result<()> {
+        for typedef in self.all_definitions.values_mut() {
+            typedef.collect_dependencies()?;
+        }
+
+        self.allow_add_deps = false; // this prevents logic bugs where new dependencies are added after this phase
+        Ok(())
+    }
+
+    pub fn write_module_tree_multifile_root(&mut self, directory: &Path) -> Result<()> {
+        let all_definitions = std::mem::replace(&mut self.all_definitions, HashMap::new());
+        let mut definitions_vec: Vec<_> = all_definitions.into_iter().map(|(k, v)| (k, v)).collect();
+        definitions_vec.sort_by(|a, b| b.0.cmp(&a.0));
+
         let mut pathbuf: PathBuf = directory.into();
         pathbuf.push("mod.rs");
         let mut file = File::create(pathbuf)?;
@@ -118,12 +143,12 @@ impl<'db> Generator<'db> {
         writeln!(file, "#![allow(non_camel_case_types, unused_imports)]")?;
 
         let mut idx = 0;
-        self.write_module_tree_multifile(&mut idx, directory, &mut file, None)?;
-
+        self.write_module_tree_multifile(&mut idx, &mut definitions_vec, directory, &mut file, None)?;
+        assert!(definitions_vec.is_empty()); // all definitions have been consumed, i.e. emitted
         Ok(())
     }
 
-    fn write_module_tree_multifile(&self, idx: &mut usize, directory: &Path, parent_file: &mut File, parent_module: Option<&Module<'db>>) -> Result<()> {
+    fn write_module_tree_multifile(&self, idx: &mut usize, definitions: &mut Vec<(FullName<'db>, TyDef<'db>)>, directory: &Path, parent_file: &mut File, parent_module: Option<&Module<'db>>) -> Result<()> {
         let mut initial_depth = self.modules[*idx].depth;
         let mut current_directory = Cow::from(directory);
         let mut owned_file = None;
@@ -140,8 +165,8 @@ impl<'db> Generator<'db> {
                 // first child
                 assert!(m.depth == initial_depth + 1);
                 let parent = &self.modules[*idx - 1];
-                self.write_module_tree_multifile(idx, &current_directory, current_file, Some(parent))?;
-                // idx now points to the next sibling or parent
+                self.write_module_tree_multifile(idx, definitions, &current_directory, current_file, Some(parent))?;
+                // `idx` now points to the next sibling or parent; `definitions` contains the remaining definitions
                 continue;
             }
 
@@ -165,7 +190,7 @@ impl<'db> Generator<'db> {
             if let Some(new_dir) = new_dir {
                 DirBuilder::new().recursive(true).create(directory)?;
                 let mut new_path = directory.join(new_dir.to_lowercase());
-                new_path.set_extension("rs1");
+                new_path.set_extension("rs");
 
                 writeln!(current_file, "pub mod {}; // {}", module_name, m.namespace)?;
 
@@ -179,7 +204,12 @@ impl<'db> Generator<'db> {
                 unclosed_module = Some((*idx, true));
             }
 
-            writeln!(current_file, "  // TODO: Contents of Namespace {}", m.namespace)?;
+            // write module contents
+            writeln!(current_file, "use crate::prelude::*;")?;
+
+            while let Some((fullname, td)) = next_from_namespace(definitions, m.namespace) {
+                td.emit(current_file)?;
+            }
 
             *idx += 1;
         }
@@ -189,5 +219,24 @@ impl<'db> Generator<'db> {
         }
 
         Ok(())
+    }
+}
+
+pub fn prevent_keywords(name: &str) -> Cow<str> {
+    // TODO: add more keywords
+    match name {
+        "type"  |
+        "Self"  |
+        "box"   |
+        "move"  |
+        "async" |
+        "await" |
+        "type"  |
+        "const" => {
+            let mut s = String::from(name);
+            s.push('_');
+            s.into()
+        }
+        _ => name.into()
     }
 }
