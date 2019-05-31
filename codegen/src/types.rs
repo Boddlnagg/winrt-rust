@@ -1,7 +1,8 @@
 use std::io::Write;
+use std::collections::HashSet;
 
-use climeta::ResolveToTypeDef;
-use climeta::schema::{TypeDef, Type, TypeTag, PrimitiveType, FieldInit, PrimitiveValue};
+use climeta::{ResolveToTypeDef, AssemblyInfo};
+use climeta::schema::{TypeDef, TypeRef, Type, TypeTag, PrimitiveType, FieldInit, PrimitiveValue};
 
 use crate::Result;
 use crate::generator::prevent_keywords;
@@ -21,7 +22,29 @@ impl<'db> TypeDefExt<'db> for TypeDef<'db> {
     }
 }
 
-pub struct Dependencies {} // TODO
+#[derive(Default, Debug)]
+pub struct Dependencies {
+    assemblies: HashSet<String>
+}
+
+impl Dependencies {
+    fn add_type(&mut self, typ: &climeta::schema::TypeDefOrRef) {
+        use climeta::schema::TypeDefOrRef::*;
+        let name = match typ {
+            TypeDef(d) => d.assembly_name().expect("TypeDef without assembly name"),
+            TypeRef(r) => match r.resolution_scope().expect("can't access resolution scope") {
+                Some(climeta::schema::ResolutionScope::AssemblyRef(asm)) => asm.name().expect("can't access assembly name"),
+                Some(_) => r.assembly_name().expect("TypeRef without assembly name"),
+                None => unimplemented!()
+            },
+            _ => unimplemented!()
+        };
+        
+        if !self.assemblies.contains(name) {
+            self.assemblies.insert(name.into());
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum TyDef<'db> {
@@ -48,21 +71,22 @@ impl<'db> TyDef<'db> {
     }
 
     pub fn collect_dependencies(&mut self) -> Result<Dependencies> {
+        let mut deps = Dependencies::default();
         match self {
             TyDef::Enum(_) => { /* Nothing to do */ },
             TyDef::Struct(td, ref mut prepared) => {
                 let result = itertools::join(td.field_list()?.map(|f| {
                     format!("{}: {}",
                         prevent_keywords(f.name().expect("can't decode struct field name")),
-                        get_type_name(f.signature().expect("can't decode struct field signature").type_(), TypeUsage::Raw).expect("can't get struct field type name"))
+                        get_type_name(f.signature().expect("can't decode struct field signature").type_(), TypeUsage::Raw, &mut deps).expect("can't get struct field type name"))
                 }), ", ");
-
+                //result.push_str(&format!(" [[deps: {:?}]]", deps));
                 std::mem::replace(prepared, result);
             },
             TyDef::Dummy => {}
         }
 
-        Ok(Dependencies {})
+        Ok(deps)
     }
 
     pub fn emit(&self, file: &mut std::fs::File) -> Result<()> {
@@ -98,7 +122,7 @@ impl<'db> TyDef<'db> {
                 // TODO: derive(Eq) whenever possible?
                 writeln!(file, "\nRT_STRUCT! {{ struct {0} {{", td.definition_name()?)?;
                 writeln!(file, "    {}", prepared)?;
-                writeln!(file, "\n}}}}")?;
+                writeln!(file, "}}}}")?;
             },
             TyDef::Dummy => {}
         }
@@ -138,25 +162,28 @@ pub fn get_type_name_primitive(ty: PrimitiveType, usage: TypeUsage) -> Result<St
     })
 }
 
-pub fn get_type_name(ty: &Type, usage: TypeUsage) -> Result<String> {
+pub fn get_type_name(ty: &Type, usage: TypeUsage, deps: &mut Dependencies) -> Result<String> {
     Ok(match ty {
         Type::Primitive(prim) => get_type_name_primitive(*prim, usage)?,
         Type::Array(array) => unimplemented!(),
-        Type::Ref(tag, def_or_ref, generic_args) => if *tag == TypeTag::ValueType {
-            let fullname = def_or_ref.namespace_name_pair();
-            if fullname == ("System", "Guid") {
-                "Guid".into()
+        Type::Ref(tag, def_or_ref, generic_args) => {
+            deps.add_type(def_or_ref);
+            if *tag == TypeTag::ValueType {
+                let fullname = def_or_ref.namespace_name_pair();
+                if fullname == ("System", "Guid") {
+                    "Guid".into()
+                } else {
+                    let mut path = format!("crate::{}::", fullname.0);
+                    let mut path = path.replace(".", "::");
+                    path.make_ascii_lowercase();
+                    path.push_str(fullname.1);
+                    path
+                }
             } else {
-                let mut path = format!("crate::{}::", fullname.0);
-                let mut path = path.replace(".", "::");
-                path.make_ascii_lowercase();
-                path.push_str(fullname.1);
-                path
+                let fullname = def_or_ref.namespace_name_pair();
+                //panic!("Unimplemented handling for {:?}", fullname);
+                format!("[WIP]{:?}", fullname)
             }
-        } else {
-            let fullname = def_or_ref.namespace_name_pair();
-            //panic!("Unimplemented handling for {:?}", fullname);
-            format!("[WIP]{:?}", fullname)
         },
         Type::GenericVar(scope, idx) => unimplemented!(),
         Type::Object => {

@@ -4,7 +4,7 @@ use std::fs::{File, DirBuilder};
 use std::io::Write;
 use std::collections::HashMap;
 
-use climeta::{Cache, ResolveToTypeDef};
+use climeta::{Cache, ResolveToTypeDef, AssemblyInfo};
 use climeta::schema::{TypeDef, TypeCategory};
 
 use crate::Result;
