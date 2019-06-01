@@ -134,6 +134,7 @@ impl<'db> TyDef<'db> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeUsage {
     In,
     Out,
@@ -168,21 +169,45 @@ pub fn get_type_name(ty: &Type, usage: TypeUsage, deps: &mut Dependencies) -> Re
         Type::Array(array) => unimplemented!(),
         Type::Ref(tag, def_or_ref, generic_args) => {
             deps.add_type(def_or_ref);
-            if *tag == TypeTag::ValueType {
-                let fullname = def_or_ref.namespace_name_pair();
-                if fullname == ("System", "Guid") {
-                    "Guid".into()
-                } else {
-                    let mut path = format!("crate::{}::", fullname.0);
-                    let mut path = path.replace(".", "::");
-                    path.make_ascii_lowercase();
-                    path.push_str(fullname.1);
-                    path
-                }
+            let fullname = def_or_ref.namespace_name_pair();
+            if fullname == ("System", "Guid") {
+                assert!(*tag == TypeTag::ValueType);
+                "Guid".into()
             } else {
-                let fullname = def_or_ref.namespace_name_pair();
-                //panic!("Unimplemented handling for {:?}", fullname);
-                format!("[WIP]{:?}", fullname)
+                let mut path = format!("crate::{}::", fullname.0);
+                path = path.replace(".", "::");
+                path.make_ascii_lowercase();
+                if let Some(i) = fullname.1.find('`') {
+                    path.push_str(&fullname.1[..i]);
+                    assert!(generic_args.is_some());
+                    let generic_args = generic_args.as_ref().unwrap().as_ref();
+                    path.push_str("<");
+                    let mut first = true;
+                    for arg in generic_args {
+                        if !first {
+                            path.push_str(", ");
+                        }
+                        path.push_str(&get_type_name(arg, usage, deps)?);
+                        first = false;
+                    }
+                    path.push_str(">");
+                    if (!ty.contains_generic_var()) {
+                        // TODO: add generic pinterface instance to output
+                    }
+                } else {
+                    path.push_str(fullname.1);
+                    assert!(generic_args.is_none());
+                }
+
+                match (tag, usage) {
+                    (TypeTag::ValueType, _) => path,
+                    (TypeTag::Class, TypeUsage::Raw) => format!("*mut {}", path),
+                    (TypeTag::Class, TypeUsage::In) => format!("&{}", path),
+                    (TypeTag::Class, TypeUsage::Out) => format!("Option<ComPtr<{}>>", path),
+                    (TypeTag::Class, TypeUsage::OutNonNull) => format!("ComPtr<{}>", path),
+                    (TypeTag::Class, TypeUsage::GenericArg) => path,
+                    _ => unimplemented!()
+                }
             }
         },
         Type::GenericVar(scope, idx) => unimplemented!(),
