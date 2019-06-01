@@ -4,7 +4,7 @@ use std::fs::{File, DirBuilder};
 use std::io::Write;
 use std::collections::HashMap;
 
-use climeta::{Cache, ResolveToTypeDef, AssemblyInfo};
+use climeta::{Cache, ResolveToTypeDef, AssemblyAccess};
 use climeta::schema::{TypeDef, TypeCategory};
 
 use crate::Result;
@@ -64,7 +64,7 @@ impl<'db> Generator<'db> {
                 let typedef = match t.type_category()? {
                     TypeCategory::Enum => TyDef::prepare_enum(t),
                     TypeCategory::Struct => TyDef::prepare_struct(t),
-                    TypeCategory::Interface => TyDef::dummy(),
+                    TypeCategory::Interface => TyDef::prepare_interface(t),
                     TypeCategory::Delegate => TyDef::dummy(),
                     TypeCategory::Class => TyDef::dummy()
                 }?;
@@ -112,9 +112,9 @@ impl<'db> Generator<'db> {
         }
     }
 
-    pub fn collect_dependencies(&mut self ) -> Result<()> {
+    pub fn collect_dependencies(&mut self, cache: &climeta::Cache) -> Result<()> {
         for typedef in self.all_definitions.values_mut() {
-            typedef.collect_dependencies()?;
+            typedef.collect_dependencies(cache)?;
         }
 
         self.allow_add_deps = false; // this prevents logic bugs where new dependencies are added after this phase

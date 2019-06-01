@@ -29,7 +29,7 @@ fn main() -> Result<()> {
     }
 
     let mut generator = Generator::new(&cache)?;
-    generator.collect_dependencies()?;
+    generator.collect_dependencies(&cache)?;
     //PrintStatistics(generator.AllTypes);
     //PrintDependencyStatistics(generator.AllTypes);
     //int pinterfaceCount = generator.EmitParametricInstances();

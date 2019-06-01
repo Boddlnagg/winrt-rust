@@ -1,8 +1,8 @@
 use std::io::Write;
 use std::collections::HashSet;
 
-use climeta::{ResolveToTypeDef, AssemblyInfo};
-use climeta::schema::{TypeDef, TypeRef, Type, TypeTag, PrimitiveType, FieldInit, PrimitiveValue};
+use climeta::{ResolveToTypeDef, AssemblyAccess};
+use climeta::schema::{self, TypeDef, TypeRef, Type, TypeTag, PrimitiveType, FieldInit, PrimitiveValue};
 
 use crate::Result;
 use crate::generator::prevent_keywords;
@@ -50,6 +50,7 @@ impl Dependencies {
 pub enum TyDef<'db> {
     Enum(TypeDef<'db>),
     Struct(TypeDef<'db>, String),
+    Interface(TypeDef<'db>),
     Dummy
 }
 
@@ -62,15 +63,20 @@ impl<'db> TyDef<'db> {
         Ok(TyDef::Struct(ty, String::new()))
     }
 
+    pub fn prepare_interface(ty: TypeDef<'db>) -> Result<TyDef<'db>> {
+        Ok(TyDef::Interface(ty))
+    }
+
     pub fn can_be_skipped(&self) -> bool {
         match self {
             TyDef::Enum(_) => false,
             TyDef::Struct(td, _) => td.field_list().unwrap().next().is_none(),
+            TyDef::Interface(_) => false,
             TyDef::Dummy => true
         }
     }
 
-    pub fn collect_dependencies(&mut self) -> Result<Dependencies> {
+    pub fn collect_dependencies(&mut self, cache: &climeta::Cache) -> Result<Dependencies> {
         let mut deps = Dependencies::default();
         match self {
             TyDef::Enum(_) => { /* Nothing to do */ },
@@ -82,6 +88,17 @@ impl<'db> TyDef<'db> {
                 }), ", ");
                 //result.push_str(&format!(" [[deps: {:?}]]", deps));
                 std::mem::replace(prepared, result);
+            },
+            TyDef::Interface(td) => {
+                let exclusive_to = td.get_attribute("Windows.Foundation.Metadata", "ExclusiveToAttribute")?;
+                if let Some(ex) = exclusive_to {
+                    let sig = ex.value(cache)?;
+                    let exclusive_to_type = match sig.fixed_args() {
+                        &[schema::FixedArg::Elem(schema::Elem::SystemType(typename))] => typename,
+                        _ => return Err("invalid signature for ExclusiveToAttribute".into())
+                    };
+                    //println!("Interface {} is exclusive to {}", td.definition_name()?, exclusive_to_type);
+                }
             },
             TyDef::Dummy => {}
         }
@@ -124,6 +141,15 @@ impl<'db> TyDef<'db> {
                 writeln!(file, "    {}", prepared)?;
                 writeln!(file, "}}}}")?;
             },
+            TyDef::Interface(td) => {
+                writeln!(file, "\nRT_INTERFACE! {{ {prepend_static}interface {name}{generic}({name}Vtbl): IInspectable(IInspectableVtbl) [IID_{name}] {{",
+                    prepend_static = "static ",
+                    name = td.definition_name()?,
+                    generic = ""
+                )?;
+                // TODO: raw methods
+                writeln!(file, "}}}}")?;
+            }
             TyDef::Dummy => {}
         }
         Ok(())
