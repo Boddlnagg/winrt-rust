@@ -50,8 +50,87 @@ impl Dependencies {
 pub enum TyDef<'db> {
     Enum(TypeDef<'db>),
     Struct(TypeDef<'db>, String),
-    Interface(TypeDef<'db>),
+    Interface(TypeDef<'db>, Option<InterfaceKind>),
     Dummy
+}
+
+#[derive(Debug)]
+pub enum InterfaceKind {
+    Factory,
+    Statics,
+    Instance
+}
+
+fn get_interface_kind<'db, 'c: 'db>(cache: &'c climeta::Cache<'c>, td: &TypeDef<'db>, exclusive_to_type: Option<TypeDef<'db>>) -> Result<InterfaceKind> {
+    let trimmed_name = td.type_name()?.trim_end_matches(&['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'][..]);
+    let guessed_from_name = trimmed_name.ends_with("Factory") || trimmed_name.ends_with("Statics");
+    let mut candidates: [Option<TypeDef>; 3] = [None, None, None];
+    if let Some(t) = exclusive_to_type {
+        candidates[0].replace(t);
+    }
+    if guessed_from_name {
+        let target_type_name = &trimmed_name[0..trimmed_name.len() - 7]; // "Factory" and "Statics" both have length 7
+        if let Some(found) = (td.type_namespace()?, target_type_name).resolve(cache) {
+            candidates[1].replace(found);
+        }
+        if target_type_name.starts_with('I') {
+            if let Some(found) = (td.type_namespace()?, &target_type_name[1..]).resolve(cache) {
+                candidates[2].replace(found);
+            }
+        }
+    }
+    let target_name = td.namespace_name_pair();
+    if candidates.iter().any(|candidate| {
+        if let Some(c) = candidate {
+            let mut types = get_factory_types(&c, cache).expect("error retrieving factory types");
+            types.any(|c2| c2 == target_name)
+        } else {
+            false
+        }
+    }) {
+        Ok(InterfaceKind::Factory)
+    } else if candidates.iter().any(|candidate| {
+        if let Some(c) = candidate {
+            let mut types = get_static_types(&c, cache).expect("error retrieving static types");
+            types.any(|c2| c2 == target_name)
+        } else {
+            false
+        }
+    }) {
+        Ok(InterfaceKind::Statics)
+    } else {
+        Ok(InterfaceKind::Instance)
+    }
+}
+
+fn get_factory_types<'db, 'c: 'db, 'r>(td: &'r TypeDef<'db>, cache: &'c climeta::Cache<'c>) -> Result<impl Iterator<Item=(&'r str, &'r str)>> where 'db: 'r, 'c: 'r {
+    let cache: &'r climeta::Cache<'r> = unsafe { std::mem::transmute(cache) }; // TODO: find a better way to shrink the lifetime here ...
+    Ok(td.custom_attributes()?.filter_map(move |attr| {
+        let pair = attr.namespace_name_pair();
+        if attr.namespace_name_pair() != ("Windows.Foundation.Metadata", "ActivatableAttribute") {
+            return None;
+        }
+        let sig: climeta::schema::CustomAttributeSig<'r> = attr.value(cache).expect("Error reading value of ActivatableAttribute");
+        match &sig.fixed_args()[0] {
+            schema::FixedArg::Elem(schema::Elem::SystemType(typename)) => Some(typename.namespace_name_pair()),
+            _ => None
+        }
+    }))
+}
+
+fn get_static_types<'db, 'c: 'db, 'r>(td: &'r TypeDef<'db>, cache: &'c climeta::Cache<'c>) -> Result<impl Iterator<Item=(&'r str, &'r str)>> where 'db: 'r, 'c: 'r {
+    let cache: &'r climeta::Cache<'r> = unsafe { std::mem::transmute(cache) }; // TODO: find a better way to shrink the lifetime here ...
+    Ok(td.custom_attributes()?.filter_map(move |attr| {
+        let pair = attr.namespace_name_pair();
+        if attr.namespace_name_pair() != ("Windows.Foundation.Metadata", "StaticAttribute") {
+            return None;
+        }
+        let sig: climeta::schema::CustomAttributeSig<'r> = attr.value(cache).expect("Error reading value of StaticAttribute");
+        match &sig.fixed_args()[0] {
+            schema::FixedArg::Elem(schema::Elem::SystemType(typename)) => Some(typename.namespace_name_pair()),
+            _ => unreachable!()
+        }
+    }))
 }
 
 impl<'db> TyDef<'db> {
@@ -64,19 +143,19 @@ impl<'db> TyDef<'db> {
     }
 
     pub fn prepare_interface(ty: TypeDef<'db>) -> Result<TyDef<'db>> {
-        Ok(TyDef::Interface(ty))
+        Ok(TyDef::Interface(ty, None))
     }
 
     pub fn can_be_skipped(&self) -> bool {
         match self {
             TyDef::Enum(_) => false,
             TyDef::Struct(td, _) => td.field_list().unwrap().next().is_none(),
-            TyDef::Interface(_) => false,
+            TyDef::Interface(..) => false,
             TyDef::Dummy => true
         }
     }
 
-    pub fn collect_dependencies(&mut self, cache: &climeta::Cache) -> Result<Dependencies> {
+    pub fn collect_dependencies<'c: 'db>(&mut self, cache: &'c climeta::Cache<'c>) -> Result<Dependencies> {
         let mut deps = Dependencies::default();
         match self {
             TyDef::Enum(_) => { /* Nothing to do */ },
@@ -89,16 +168,19 @@ impl<'db> TyDef<'db> {
                 //result.push_str(&format!(" [[deps: {:?}]]", deps));
                 std::mem::replace(prepared, result);
             },
-            TyDef::Interface(td) => {
+            TyDef::Interface(td, ref mut kind) => {
                 let exclusive_to = td.get_attribute("Windows.Foundation.Metadata", "ExclusiveToAttribute")?;
-                if let Some(ex) = exclusive_to {
+                let exclusive_to_type = if let Some(ex) = exclusive_to {
                     let sig = ex.value(cache)?;
-                    let exclusive_to_type = match sig.fixed_args() {
-                        &[schema::FixedArg::Elem(schema::Elem::SystemType(typename))] => typename,
+                    match sig.fixed_args() {
+                        &[schema::FixedArg::Elem(schema::Elem::SystemType(typename))] => Some(typename.resolve(cache).expect("ExclusiveTo type not found")),
                         _ => return Err("invalid signature for ExclusiveToAttribute".into())
-                    };
-                    //println!("Interface {} is exclusive to {}", td.definition_name()?, exclusive_to_type);
-                }
+                    }
+                } else {
+                    None
+                };
+                kind.replace(get_interface_kind(cache, td, exclusive_to_type)?);
+                //println!("Interface {} is of kind {:?}", td.definition_name()?, kind);
             },
             TyDef::Dummy => {}
         }
@@ -141,9 +223,12 @@ impl<'db> TyDef<'db> {
                 writeln!(file, "    {}", prepared)?;
                 writeln!(file, "}}}}")?;
             },
-            TyDef::Interface(td) => {
+            TyDef::Interface(td, kind) => {
                 writeln!(file, "\nRT_INTERFACE! {{ {prepend_static}interface {name}{generic}({name}Vtbl): IInspectable(IInspectableVtbl) [IID_{name}] {{",
-                    prepend_static = "static ",
+                    prepend_static = match kind.as_ref().unwrap() {
+                        InterfaceKind::Factory | InterfaceKind::Statics => "static ",
+                        InterfaceKind::Instance => ""
+                    },
                     name = td.definition_name()?,
                     generic = ""
                 )?;
@@ -217,7 +302,7 @@ pub fn get_type_name(ty: &Type, usage: TypeUsage, deps: &mut Dependencies) -> Re
                         first = false;
                     }
                     path.push_str(">");
-                    if (!ty.contains_generic_var()) {
+                    if !ty.contains_generic_var() {
                         // TODO: add generic pinterface instance to output
                     }
                 } else {

@@ -112,7 +112,7 @@ impl<'db> Generator<'db> {
         }
     }
 
-    pub fn collect_dependencies(&mut self, cache: &climeta::Cache) -> Result<()> {
+    pub fn collect_dependencies(&mut self, cache: &'db climeta::Cache<'db>) -> Result<()> {
         for typedef in self.all_definitions.values_mut() {
             typedef.collect_dependencies(cache)?;
         }
