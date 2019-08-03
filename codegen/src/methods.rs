@@ -106,7 +106,7 @@ impl<'db> Method<'db> {
         Ok(result)
     }
 
-    pub fn emit_raw_declaration(&self, indentation: &str, index: usize, file: &mut std::fs::File) -> Result<()> {
+    pub fn emit_raw_declaration<W: Write>(&self, indentation: &str, index: usize, file: &mut W) -> Result<()> {
         let condition = self.dependencies.make_feature_condition(&self.md);
         write!(file, "{}", indentation)?;
         if condition.is_empty() {

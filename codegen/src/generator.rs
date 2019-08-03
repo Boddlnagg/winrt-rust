@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::fs::{File, DirBuilder};
-use std::io::Write;
+use std::io::{Write, BufWriter};
 use std::collections::HashMap;
 
 use climeta::{Cache, ResolveToTypeDef, AssemblyAccess};
@@ -128,7 +128,7 @@ impl<'db> Generator<'db> {
 
         let mut pathbuf: PathBuf = directory.into();
         pathbuf.push("mod.rs");
-        let mut file = File::create(pathbuf)?;
+        let mut file = BufWriter::new(File::create(pathbuf)?);
         writeln!(file, "// DO NOT MODIFY THIS MODULE NOR ANY OF ITS CHILDREN - THEY ARE AUTOMATICALLY GENERATED!")?;
         writeln!(file, "#![allow(non_camel_case_types, unused_imports)]")?;
 
@@ -138,7 +138,7 @@ impl<'db> Generator<'db> {
         Ok(())
     }
 
-    fn write_module_tree_multifile(&self, idx: &mut usize, definitions: &mut Vec<(FullName<'db>, TyDef<'db>)>, directory: &Path, parent_file: &mut File, parent_module: Option<&Module<'db>>) -> Result<()> {
+    fn write_module_tree_multifile(&self, idx: &mut usize, definitions: &mut Vec<(FullName<'db>, TyDef<'db>)>, directory: &Path, parent_file: &mut BufWriter<File>, parent_module: Option<&Module<'db>>) -> Result<()> {
         let initial_depth = self.modules[*idx].depth;
         let mut current_directory = Cow::from(directory);
         let mut owned_file = None;
@@ -184,7 +184,7 @@ impl<'db> Generator<'db> {
 
                 writeln!(current_file, "pub mod {}; // {}", module_name, m.namespace)?;
 
-                owned_file = Some(File::create(&new_path)?);
+                owned_file = Some(BufWriter::new(File::create(&new_path)?));
                 current_file = owned_file.as_mut().unwrap();
                 new_path.set_extension("");
                 current_directory = Cow::from(new_path);

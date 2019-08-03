@@ -84,7 +84,7 @@ impl FeatureCondition {
         self.conditions.is_empty()
     }
 
-    pub fn emit_attribute(&self, file: &mut std::fs::File) -> Result<()> {
+    pub fn emit_attribute<W: Write>(&self, file: &mut W) -> Result<()> {
         match self.conditions.len() {
             0 => (),
             1 => write!(file, "#[cfg({})]", self.conditions[0])?,
@@ -106,7 +106,7 @@ impl FeatureCondition {
         Ok(())
     }
 
-    pub fn emit_inverted_attribute(&self, file: &mut std::fs::File) -> Result<()> {
+    pub fn emit_inverted_attribute<W: Write>(&self, file: &mut W) -> Result<()> {
         match self.conditions.len() {
             0 => (),
             1 => write!(file, "#[cfg(not({}))]", self.conditions[0])?,
@@ -304,7 +304,7 @@ impl<'db> TyDef<'db> {
         Ok(deps)
     }
 
-    pub fn emit(&self, file: &mut std::fs::File) -> Result<()> {
+    pub fn emit<W: Write>(&self, file: &mut W) -> Result<()> {
         match self {
             TyDef::Enum(ref td) => {
                 let underlying = td.enum_get_underlying_type()?;
