@@ -224,7 +224,7 @@ impl<'db> TyDef<'db> {
                 writeln!(file, "}}}}")?;
             },
             TyDef::Interface(td, kind) => {
-                writeln!(file, "\nRT_INTERFACE! {{ {prepend_static}interface {name}{generic}({name}Vtbl): IInspectable(IInspectableVtbl) [IID_{name}] {{",
+                writeln!(file, "\nRT_INTERFACE! {{ {prepend_static}interface {name}{generic}({name}Vtbl): IInspectable [IID_{name}] {{",
                     prepend_static = match kind.as_ref().unwrap() {
                         InterfaceKind::Factory | InterfaceKind::Statics => "static ",
                         InterfaceKind::Instance => ""
@@ -312,10 +312,10 @@ pub fn get_type_name(ty: &Type, usage: TypeUsage, deps: &mut Dependencies) -> Re
 
                 match (tag, usage) {
                     (TypeTag::ValueType, _) => path,
-                    (TypeTag::Class, TypeUsage::Raw) => format!("*mut {}", path),
+                    (TypeTag::Class, TypeUsage::Raw) => format!("<{} as RtType>::Abi", path),
                     (TypeTag::Class, TypeUsage::In) => format!("&{}", path),
-                    (TypeTag::Class, TypeUsage::Out) => format!("Option<ComPtr<{}>>", path),
-                    (TypeTag::Class, TypeUsage::OutNonNull) => format!("ComPtr<{}>", path),
+                    (TypeTag::Class, TypeUsage::Out) => format!("Option<{}>", path),
+                    (TypeTag::Class, TypeUsage::OutNonNull) => path,
                     (TypeTag::Class, TypeUsage::GenericArg) => path,
                     _ => unimplemented!()
                 }
@@ -324,9 +324,9 @@ pub fn get_type_name(ty: &Type, usage: TypeUsage, deps: &mut Dependencies) -> Re
         Type::GenericVar(scope, idx) => unimplemented!(),
         Type::Object => {
             match usage {
-                TypeUsage::Raw => "*mut IInspectable".into(),
+                TypeUsage::Raw => "<IInspectable as RtType>::Abi".into(),
                 TypeUsage::In => "&IInspectable".into(),
-                TypeUsage::Out => "Option<ComPtr<IInspectable>>".into(),
+                TypeUsage::Out => "Option<IInspectable>".into(),
                 TypeUsage::GenericArg => "IInspectable".into(),
                 _ => unimplemented!()
             }
