@@ -8,13 +8,14 @@ use crate::types::{self, Dependencies, TypeUsage};
 
 pub struct Method<'db> {
     md: MethodDef<'db>,
+    dependencies: Dependencies,
     raw_name: String,
     raw_params: String,
     wrapped_name: String,
 }
 
 impl<'db> Method<'db> {
-    pub fn new<'c: 'db>(md: MethodDef<'db>, td: &TypeDef<'db>, cache: &'c climeta::Cache<'c>, dependencies: &mut Dependencies) -> Result<Method<'db>> {
+    pub fn new<'c: 'db>(md: MethodDef<'db>, td: &TypeDef<'db>, cache: &'c climeta::Cache<'c>) -> Result<Method<'db>> {
         let raw_name = if let Some(overload) = md.get_attribute("Windows.Foundation.Metadata", "OverloadAttribute")? {
             match overload.value(cache)?.fixed_args() {
                 &[schema::FixedArg::Elem(schema::Elem::String(Some(name)))] => name.to_string(),
@@ -24,14 +25,21 @@ impl<'db> Method<'db> {
             md.name()?.to_string()
         };
 
-        let raw_params = Self::prepare_raw_params(&md, td, cache, dependencies)?;
+        let mut dependencies = Dependencies::default();
+
+        let raw_params = Self::prepare_raw_params(&md, td, cache, &mut dependencies)?;
 
         Ok(Method {
             md: md,
+            dependencies: dependencies,
             raw_name: raw_name,
             raw_params: raw_params,
             wrapped_name: String::new(),
         })
+    }
+
+    pub fn dependencies(&self) -> &Dependencies {
+        &self.dependencies
     }
 
     fn prepare_raw_params<'c: 'db>(md: &MethodDef<'db>, td: &TypeDef<'db>, cache: &'c climeta::Cache<'c>, dependencies: &mut Dependencies) -> Result<String> {
@@ -98,8 +106,18 @@ impl<'db> Method<'db> {
         Ok(result)
     }
 
-    pub fn emit_raw_declaration(&self, file: &mut std::fs::File) -> Result<()> {
-        write!(file, "fn {name}(&self{raw_params}) -> HRESULT", name = self.raw_name, raw_params = self.raw_params)?;
+    pub fn emit_raw_declaration(&self, indentation: &str, index: usize, file: &mut std::fs::File) -> Result<()> {
+        let condition = self.dependencies.make_feature_condition(&self.md);
+        write!(file, "{}", indentation)?;
+        if condition.is_empty() {
+            write!(file, "fn {name}(&self{raw_params}) -> HRESULT", name = self.raw_name, raw_params = self.raw_params)?;
+        } else {
+            condition.emit_inverted_attribute(file)?;
+            writeln!(file, " fn __Dummy{}(&self) -> ()", index)?;
+            write!(file, "{}", indentation)?;
+            condition.emit_attribute(file)?;
+            write!(file, " fn {name}(&self{raw_params}) -> HRESULT", name = self.raw_name, raw_params = self.raw_params)?;
+        }
         Ok(())
     }
 }

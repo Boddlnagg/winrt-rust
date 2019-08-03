@@ -45,6 +45,88 @@ impl Dependencies {
             self.assemblies.insert(name.into());
         }
     }
+
+    fn extend(&mut self, other: &Dependencies) {
+        for name in other.assemblies.iter() {
+            if !self.assemblies.contains(name) {
+                self.assemblies.insert(name.into());
+            }
+        }
+    }
+
+    pub fn make_feature_condition<T: climeta::AssemblyAccess>(&self, defining_assembly: &T) -> FeatureCondition {
+        let mut result = self.assemblies.iter().filter_map(|asm| {
+            if asm != "mscorlib" && asm != "Windows.Foundation" {
+                if let Some(def_asm) = defining_assembly.assembly_name() {
+                    if def_asm == asm {
+                        return None;
+                    }
+                }
+                // TODO: skip defining assembly
+                let mut feature_name = asm.replace('.', "-");
+                feature_name.make_ascii_lowercase();
+                Some(format!("feature=\"{}\"", feature_name))
+            } else {
+                None
+            }
+        }).collect::<Vec<String>>();
+        result.sort();
+        FeatureCondition { conditions: result }
+    }
+}
+
+pub struct FeatureCondition {
+    conditions: Vec<String>
+}
+
+impl FeatureCondition {
+    pub fn is_empty(&self) -> bool {
+        self.conditions.is_empty()
+    }
+
+    pub fn emit_attribute(&self, file: &mut std::fs::File) -> Result<()> {
+        match self.conditions.len() {
+            0 => (),
+            1 => write!(file, "#[cfg({})]", self.conditions[0])?,
+            _ => {
+                write!(file, "#[cfg(all(")?;
+                let mut first = true;
+                for cond in &self.conditions {
+                    let comma = if first {
+                        first = false;
+                        ""
+                    } else {
+                        ","
+                    };
+                    write!(file, "{}{}", comma, cond)?;
+                }
+                write!(file, "))]")?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn emit_inverted_attribute(&self, file: &mut std::fs::File) -> Result<()> {
+        match self.conditions.len() {
+            0 => (),
+            1 => write!(file, "#[cfg(not({}))]", self.conditions[0])?,
+            _ => {
+                write!(file, "#[cfg(not(all(")?;
+                let mut first = true;
+                for cond in &self.conditions {
+                    let comma = if first {
+                        first = false;
+                        ""
+                    } else {
+                        ","
+                    };
+                    write!(file, "{}{}", comma, cond)?;
+                }
+                write!(file, ")))]")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -206,7 +288,12 @@ impl<'db> TyDef<'db> {
                     if md.name().expect("method without name") == ".ctor" {
                         None
                     } else {
-                        Some(methods::Method::new(md, &td, cache, deps_ref))
+                        let m = methods::Method::new(md, &td, cache);
+                        let m = m.and_then(|meth| {
+                            deps_ref.extend(meth.dependencies());
+                            Ok(meth)
+                        });
+                        Some(m)
                     }
                  }).collect::<Result<Vec<_>>>()?);
 
@@ -287,8 +374,7 @@ impl<'db> TyDef<'db> {
                     generic = generic
                 )?;
                 for (i, meth) in methods.iter().enumerate() {
-                    write!(file, "    ")?;
-                    meth.emit_raw_declaration(file)?;
+                    meth.emit_raw_declaration("    ", i, file)?;
                     let comma = if i == methods.len() - 1 { "" } else { "," };
                     writeln!(file, "{}", comma)?;
                 }
