@@ -50,7 +50,7 @@ impl Dependencies {
 pub enum TyDef<'db> {
     Enum(TypeDef<'db>),
     Struct(TypeDef<'db>, String),
-    Interface(TypeDef<'db>, Option<InterfaceKind>),
+    Interface(TypeDef<'db>, Option<InterfaceKind>, String),
     Dummy
 }
 
@@ -106,7 +106,6 @@ fn get_interface_kind<'db, 'c: 'db>(cache: &'c climeta::Cache<'c>, td: &TypeDef<
 fn get_factory_types<'db, 'c: 'db, 'r>(td: &'r TypeDef<'db>, cache: &'c climeta::Cache<'c>) -> Result<impl Iterator<Item=(&'r str, &'r str)>> where 'db: 'r, 'c: 'r {
     let cache: &'r climeta::Cache<'r> = unsafe { std::mem::transmute(cache) }; // TODO: find a better way to shrink the lifetime here ...
     Ok(td.custom_attributes()?.filter_map(move |attr| {
-        let pair = attr.namespace_name_pair();
         if attr.namespace_name_pair() != ("Windows.Foundation.Metadata", "ActivatableAttribute") {
             return None;
         }
@@ -121,7 +120,6 @@ fn get_factory_types<'db, 'c: 'db, 'r>(td: &'r TypeDef<'db>, cache: &'c climeta:
 fn get_static_types<'db, 'c: 'db, 'r>(td: &'r TypeDef<'db>, cache: &'c climeta::Cache<'c>) -> Result<impl Iterator<Item=(&'r str, &'r str)>> where 'db: 'r, 'c: 'r {
     let cache: &'r climeta::Cache<'r> = unsafe { std::mem::transmute(cache) }; // TODO: find a better way to shrink the lifetime here ...
     Ok(td.custom_attributes()?.filter_map(move |attr| {
-        let pair = attr.namespace_name_pair();
         if attr.namespace_name_pair() != ("Windows.Foundation.Metadata", "StaticAttribute") {
             return None;
         }
@@ -143,7 +141,7 @@ impl<'db> TyDef<'db> {
     }
 
     pub fn prepare_interface(ty: TypeDef<'db>) -> Result<TyDef<'db>> {
-        Ok(TyDef::Interface(ty, None))
+        Ok(TyDef::Interface(ty, None, String::new()))
     }
 
     pub fn can_be_skipped(&self) -> bool {
@@ -168,7 +166,7 @@ impl<'db> TyDef<'db> {
                 //result.push_str(&format!(" [[deps: {:?}]]", deps));
                 std::mem::replace(prepared, result);
             },
-            TyDef::Interface(td, ref mut kind) => {
+            TyDef::Interface(td, ref mut kind, ref mut guid) => {
                 let exclusive_to = td.get_attribute("Windows.Foundation.Metadata", "ExclusiveToAttribute")?;
                 let exclusive_to_type = if let Some(ex) = exclusive_to {
                     let sig = ex.value(cache)?;
@@ -181,6 +179,24 @@ impl<'db> TyDef<'db> {
                 };
                 kind.replace(get_interface_kind(cache, td, exclusive_to_type)?);
                 //println!("Interface {} is of kind {:?}", td.definition_name()?, kind);
+
+                let guid_attr = td.get_attribute("Windows.Foundation.Metadata", "GuidAttribute")?.expect("Interface without GuidAttribute");
+                let sig = guid_attr.value(cache)?;
+                let mut first = true;
+                for arg in sig.fixed_args() {
+                    use std::fmt::Write;
+                    match arg {
+                        schema::FixedArg::Elem(schema::Elem::Primitive(prim)) => {
+                            if first {
+                                write!(guid, "{}", prim)?;
+                                first = false;
+                            } else {
+                                write!(guid, ", {}", prim)?;
+                            }
+                        },
+                        _ => unreachable!()
+                    }
+                };
             },
             TyDef::Dummy => {}
         }
@@ -223,13 +239,15 @@ impl<'db> TyDef<'db> {
                 writeln!(file, "    {}", prepared)?;
                 writeln!(file, "}}}}")?;
             },
-            TyDef::Interface(td, kind) => {
-                writeln!(file, "\nRT_INTERFACE! {{ {prepend_static}interface {name}{generic}({name}Vtbl): IInspectable [IID_{name}] {{",
+            TyDef::Interface(td, kind, guid) => {
+                let definition_name = td.definition_name()?;
+                writeln!(file, "\nDEFINE_IID!(IID_{name}, {guid});", name = definition_name, guid = guid)?;
+                writeln!(file, "RT_INTERFACE! {{ {prepend_static}interface {name}{generic}({name}Vtbl): IInspectable [IID_{name}] {{",
                     prepend_static = match kind.as_ref().unwrap() {
                         InterfaceKind::Factory | InterfaceKind::Statics => "static ",
                         InterfaceKind::Instance => ""
                     },
-                    name = td.definition_name()?,
+                    name = definition_name,
                     generic = ""
                 )?;
                 // TODO: raw methods
