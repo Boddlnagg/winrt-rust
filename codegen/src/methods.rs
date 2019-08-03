@@ -1,5 +1,6 @@
 use std::io::Write;
 
+use climeta::ResolveToTypeDef;
 use climeta::schema::{self, MethodDef, TypeDef, TypeRef, Type, TypeTag, PrimitiveType, FieldInit, PrimitiveValue};
 
 use crate::Result;
@@ -87,7 +88,20 @@ impl<'db> Method<'db> {
             result.push_str(": ");
             match mpar_t.kind() {
                 schema::ParamKind::Type(ty) => result.push_str(&types::get_type_name(ty, TypeUsage::Raw, dependencies, Some(td))?),
-                schema::ParamKind::TypeByRef(ty) => result.push_str(&types::get_type_name_by_ref(ty, TypeUsage::Raw, dependencies, Some(td), false)?),
+                schema::ParamKind::TypeByRef(ty) => {
+                    let mut has_const_modifier = false;
+                    for cmod in mpar_t.custom_mod() {
+                        if cmod.type_().namespace_name_pair() == ("System.Runtime.CompilerServices", "IsConst") {
+                            has_const_modifier = true;
+                            continue;
+                        }
+
+                        if cmod.tag() == schema::CustomModTag::Required {
+                            unimplemented!()
+                        }
+                    }
+                    result.push_str(&types::get_type_name_by_ref(ty, TypeUsage::Raw, dependencies, Some(td), has_const_modifier)?)
+                },
                 _ => unimplemented!()
             }
         }
