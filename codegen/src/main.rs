@@ -7,6 +7,7 @@ use climeta::{Cache, Database};
 
 pub(crate) mod generator;
 pub(crate) mod types;
+pub(crate) mod methods;
 
 use generator::Generator;
 

@@ -5,6 +5,7 @@ use climeta::{ResolveToTypeDef, AssemblyAccess};
 use climeta::schema::{self, TypeDef, TypeRef, Type, TypeTag, PrimitiveType, FieldInit, PrimitiveValue};
 
 use crate::Result;
+use crate::methods;
 use crate::generator::prevent_keywords;
 
 trait TypeDefExt<'db> {
@@ -50,7 +51,7 @@ impl Dependencies {
 pub enum TyDef<'db> {
     Enum(TypeDef<'db>),
     Struct(TypeDef<'db>, String),
-    Interface(TypeDef<'db>, Option<InterfaceKind>, String),
+    Interface(TypeDef<'db>, Option<InterfaceKind>, String, Vec<methods::Method<'db>>),
     Dummy
 }
 
@@ -141,7 +142,7 @@ impl<'db> TyDef<'db> {
     }
 
     pub fn prepare_interface(ty: TypeDef<'db>) -> Result<TyDef<'db>> {
-        Ok(TyDef::Interface(ty, None, String::new()))
+        Ok(TyDef::Interface(ty, None, String::new(), Vec::new()))
     }
 
     pub fn can_be_skipped(&self) -> bool {
@@ -161,12 +162,12 @@ impl<'db> TyDef<'db> {
                 let result = itertools::join(td.field_list()?.map(|f| {
                     format!("{}: {}",
                         prevent_keywords(f.name().expect("can't decode struct field name")),
-                        get_type_name(f.signature().expect("can't decode struct field signature").type_(), TypeUsage::Raw, &mut deps).expect("can't get struct field type name"))
+                        get_type_name(f.signature().expect("can't decode struct field signature").type_(), TypeUsage::Raw, &mut deps, Some(&td)).expect("can't get struct field type name"))
                 }), ", ");
                 //result.push_str(&format!(" [[deps: {:?}]]", deps));
                 std::mem::replace(prepared, result);
             },
-            TyDef::Interface(td, ref mut kind, ref mut guid) => {
+            TyDef::Interface(td, ref mut kind, ref mut guid, ref mut methods) => {
                 let exclusive_to = td.get_attribute("Windows.Foundation.Metadata", "ExclusiveToAttribute")?;
                 let exclusive_to_type = if let Some(ex) = exclusive_to {
                     let sig = ex.value(cache)?;
@@ -180,6 +181,7 @@ impl<'db> TyDef<'db> {
                 kind.replace(get_interface_kind(cache, td, exclusive_to_type)?);
                 //println!("Interface {} is of kind {:?}", td.definition_name()?, kind);
 
+                // read GUID
                 let guid_attr = td.get_attribute("Windows.Foundation.Metadata", "GuidAttribute")?.expect("Interface without GuidAttribute");
                 let sig = guid_attr.value(cache)?;
                 let mut first = true;
@@ -197,6 +199,17 @@ impl<'db> TyDef<'db> {
                         _ => unreachable!()
                     }
                 };
+
+                // read methods
+                let deps_ref = &mut deps;
+                std::mem::replace(methods, td.method_list()?.filter_map(move |md| {
+                    if md.name().expect("method without name") == ".ctor" {
+                        None
+                    } else {
+                        Some(methods::Method::new(md, &td, cache, deps_ref))
+                    }
+                 }).collect::<Result<Vec<_>>>()?);
+
             },
             TyDef::Dummy => {}
         }
@@ -239,8 +252,31 @@ impl<'db> TyDef<'db> {
                 writeln!(file, "    {}", prepared)?;
                 writeln!(file, "}}}}")?;
             },
-            TyDef::Interface(td, kind, guid) => {
+            TyDef::Interface(td, kind, guid, methods) => {
                 let definition_name = td.definition_name()?;
+                let generic_params = td.generic_params()?;
+                let (generic, generic_with_bounds) = if !generic_params.is_empty() {
+                    let mut generic = "<".to_string();
+                    let mut generic_with_bounds = "<".to_string();
+                    let mut first = true;
+                    for gp in generic_params {
+                        if !first {
+                            generic.push_str(", ");
+                            generic_with_bounds.push_str(", ");
+                        } else {
+                            first = false;
+                        }
+                        generic.push_str(gp.name()?);
+                        generic_with_bounds.push_str(gp.name()?);
+                        generic_with_bounds.push_str(": RtType");
+                    }
+                    generic.push('>');
+                    generic_with_bounds.push('>');
+                    (generic, generic_with_bounds)
+                } else {
+                    (String::new(), String::new())
+                };
+
                 writeln!(file, "\nDEFINE_IID!(IID_{name}, {guid});", name = definition_name, guid = guid)?;
                 writeln!(file, "RT_INTERFACE! {{ {prepend_static}interface {name}{generic}({name}Vtbl): IInspectable [IID_{name}] {{",
                     prepend_static = match kind.as_ref().unwrap() {
@@ -248,8 +284,14 @@ impl<'db> TyDef<'db> {
                         InterfaceKind::Instance => ""
                     },
                     name = definition_name,
-                    generic = ""
+                    generic = generic
                 )?;
+                for (i, meth) in methods.iter().enumerate() {
+                    write!(file, "    ")?;
+                    meth.emit_raw_declaration(file)?;
+                    let comma = if i == methods.len() - 1 { "" } else { "," };
+                    writeln!(file, "{}", comma)?;
+                }
                 // TODO: raw methods
                 writeln!(file, "}}}}")?;
             }
@@ -292,10 +334,31 @@ pub fn get_type_name_primitive(ty: PrimitiveType, usage: TypeUsage) -> Result<St
     })
 }
 
-pub fn get_type_name(ty: &Type, usage: TypeUsage, deps: &mut Dependencies) -> Result<String> {
+pub fn get_type_name_by_ref(ty: &Type, usage: TypeUsage, deps: &mut Dependencies, generic_context: Option<&TypeDef>, has_const_modifier: bool) -> Result<String> {
+    Ok(if has_const_modifier {
+        match usage {
+            TypeUsage::Raw => format!("*const {}", get_type_name(ty, usage, deps, generic_context)?),
+            TypeUsage::In => format!("&{}", get_type_name(ty, usage, deps, generic_context)?),
+            _ => unimplemented!()
+        }
+    } else {
+        match usage {
+            TypeUsage::Raw => format!("*mut {}", get_type_name(ty, usage, deps, generic_context)?),
+            TypeUsage::In => format!("&mut {}", get_type_name(ty, usage, deps, generic_context)?),
+            _ => unimplemented!()
+        }
+    })
+}
+
+pub fn get_type_name(ty: &Type, usage: TypeUsage, deps: &mut Dependencies, generic_context: Option<&TypeDef>) -> Result<String> {
     Ok(match ty {
         Type::Primitive(prim) => get_type_name_primitive(*prim, usage)?,
-        Type::Array(array) => unimplemented!(),
+        Type::Array(array) => {
+            match usage {
+                TypeUsage::Out => format!("ComArray<{}>", get_type_name(array.elem_type(), TypeUsage::GenericArg, deps, generic_context)?),
+                _ => format!("*mut {}", get_type_name(array.elem_type(), usage, deps, generic_context)?)
+            }
+        }
         Type::Ref(tag, def_or_ref, generic_args) => {
             deps.add_type(def_or_ref);
             let fullname = def_or_ref.namespace_name_pair();
@@ -316,7 +379,7 @@ pub fn get_type_name(ty: &Type, usage: TypeUsage, deps: &mut Dependencies) -> Re
                         if !first {
                             path.push_str(", ");
                         }
-                        path.push_str(&get_type_name(arg, usage, deps)?);
+                        path.push_str(&get_type_name(arg, TypeUsage::GenericArg, deps, generic_context)?);
                         first = false;
                     }
                     path.push_str(">");
@@ -339,7 +402,26 @@ pub fn get_type_name(ty: &Type, usage: TypeUsage, deps: &mut Dependencies) -> Re
                 }
             }
         },
-        Type::GenericVar(scope, idx) => unimplemented!(),
+        Type::GenericVar(scope, idx) => {
+            let var_name = match scope {
+                schema::GenericVarScope::Method => unimplemented!(),
+                schema::GenericVarScope::Type => generic_context
+                                                    .expect("no generic context provided")
+                                                    .generic_params()?
+                                                    .nth(*idx as usize)
+                                                    .expect("generic param out of bounds")
+                                                    .name()?.to_string()
+            };
+
+            match usage {
+                TypeUsage::Raw => format!("{}::Abi", var_name),
+                TypeUsage::In => format!("&{}::In", var_name),
+                TypeUsage::Out => format!("{}::Out", var_name),
+                TypeUsage::OutNonNull => var_name.to_string(),
+                TypeUsage::GenericArg => var_name.to_string(),
+                _ => unimplemented!()
+            }
+        }
         Type::Object => {
             match usage {
                 TypeUsage::Raw => "<IInspectable as RtType>::Abi".into(),
