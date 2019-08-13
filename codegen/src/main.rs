@@ -4,6 +4,7 @@ use std::fs::{self, DirBuilder};
 use std::io::Write;
 
 use climeta::{Cache, Database};
+#[macro_use] extern crate lazy_static;
 
 pub(crate) mod generator;
 pub(crate) mod types;

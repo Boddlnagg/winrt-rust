@@ -212,7 +212,7 @@ impl<'db> Generator<'db> {
     }
 }
 
-pub fn prevent_keywords(name: &str) -> Cow<str> {
+pub fn is_keyword(name: &str) -> bool {
     // TODO: add more keywords
     match name {
         "type"  |
@@ -221,11 +221,23 @@ pub fn prevent_keywords(name: &str) -> Cow<str> {
         "move"  |
         "async" |
         "await" |
-        "const" => {
-            let mut s = String::from(name);
-            s.push('_');
-            s.into()
-        }
-        _ => name.into()
+        "const" => true,
+        _ => false
+    }
+}
+
+pub fn prevent_keywords(name: &str) -> Cow<str> {
+    if is_keyword(name) {
+        let mut s = String::from(name);
+        s.push('_');
+        s.into()
+    } else {
+        name.into()
+    }
+}
+
+pub fn prevent_keywords_buf(name: &mut String) {
+    if is_keyword(&name) {
+        name.push('_');
     }
 }

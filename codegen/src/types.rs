@@ -378,8 +378,21 @@ impl<'db> TyDef<'db> {
                     let comma = if i == methods.len() - 1 { "" } else { "," };
                     writeln!(file, "{}", comma)?;
                 }
-                // TODO: raw methods
                 writeln!(file, "}}}}")?;
+
+                if !methods.is_empty() {
+                    writeln!(file, "impl{generic_with_bounds} {name}{generic} {{",
+                        generic_with_bounds = generic_with_bounds,
+                        name = definition_name,
+                        generic = generic
+                    )?;
+                    let mut wrapper_name = String::new();
+                    for (i, meth) in methods.iter().enumerate() {
+                        meth.get_wrapper_name(&methods[..], &mut wrapper_name);
+                        meth.emit_wrapper("    ", &wrapper_name, file)?;
+                    }
+                    writeln!(file, "}}")?
+                }
             }
             TyDef::Dummy => {}
         }
