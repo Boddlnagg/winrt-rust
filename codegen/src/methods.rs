@@ -419,3 +419,24 @@ impl<'db> std::fmt::Debug for Method<'db> {
         write!(f, "Method '{}'", self.raw_name)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    fn camel_to_snake_case(input: &str) -> String {
+        let mut result = String::new();
+        super::camel_to_snake_case(input, &mut result);
+        result
+    }
+
+    #[test]
+    fn test_camel_to_snake_case() {
+        assert_eq!(camel_to_snake_case("HelloWorld"), "hello_world");
+        assert_eq!(camel_to_snake_case("DoUIAction"), "do_ui_action");
+        assert_eq!(camel_to_snake_case("get_Direct3D11Device"), "get_direct3d11_device");
+        assert_eq!(camel_to_snake_case("GetUIElement"), "get_uielement");
+        assert_eq!(camel_to_snake_case("GetAsUInt"), "get_as_uint");
+        assert_eq!(camel_to_snake_case("ExecuteJavaScript"), "execute_javascript");
+        assert_eq!(camel_to_snake_case("IsIndexedDBEnabled"), "is_indexeddb_enabled");
+        assert_eq!(camel_to_snake_case("get_3DCoordinates"), "get_3d_coordinates");
+    }
+}
