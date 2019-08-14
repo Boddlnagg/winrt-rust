@@ -8,7 +8,7 @@ use regex::bytes::Regex;
 
 use crate::Result;
 use crate::generator::{prevent_keywords, prevent_keywords_buf};
-use crate::types::{self, Dependencies, TypeUsage};
+use crate::types::{self, Dependencies, TypeUsage, InterfaceKind};
 
 static MUTATING_METHODS: &'static [(&str, &str, &str)] = &[
     // MUST BE LEXICOGRAPHICALLY SORTED!
@@ -95,17 +95,51 @@ fn camel_to_snake_case(input: &str, result: &mut String) {
     }
 }
 
+fn is_return_type_nonnull(ty: &Type) -> Result<bool> {
+
+    static NONNULL_RET_TYPES: &'static [(&str, &str)] = &[
+        // MUST BE LEXICOGRAPHICALLY SORTED!
+        ("Windows.Foundation", "IAsyncAction"),
+        ("Windows.Foundation", "IAsyncActionWithProgress`1"),
+        ("Windows.Foundation", "IAsyncOperation`1"),
+        ("Windows.Foundation", "IAsyncOperationWithProgress`2"),
+    ];
+
+    Ok(match ty {
+        Type::Ref(tag, def_or_ref, generic_args) => {
+            let fullname = def_or_ref.namespace_name_pair();
+            if let Ok(_) = NONNULL_RET_TYPES.binary_search(&fullname) {
+                true
+            } else {
+                // TODO: return true also if default interface is in NONNULL_RET_TYPES
+                false
+            }
+        },
+        _ => false
+    })
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum InputKind {
+    Default,
+    Raw,
+    Slice,
+    MutSlice,
+    VecBuffer,
+}
+
 pub struct Method<'db> {
     md: MethodDef<'db>,
     dependencies: Dependencies,
     raw_name: String,
     raw_params: String,
-    wrapped_name: String, // TODO: call get_wrapper_name here and "fixup" conflicting names in a single pass after that
+    return_type: String,
+    input_params: String,
     is_mutating: bool,
 }
 
 impl<'db> Method<'db> {
-    pub fn new<'c: 'db>(md: MethodDef<'db>, td: &TypeDef<'db>, cache: &'c climeta::Cache<'c>) -> Result<Method<'db>> {
+    pub fn new<'c: 'db>(md: MethodDef<'db>, td: &TypeDef<'db>, cache: &'c climeta::Cache<'c>, kind: InterfaceKind) -> Result<Method<'db>> {
         let raw_name = if let Some(overload) = md.get_attribute("Windows.Foundation.Metadata", "OverloadAttribute")? {
             match overload.value(cache)?.fixed_args() {
                 &[schema::FixedArg::Elem(schema::Elem::String(Some(name)))] => name.to_string(),
@@ -117,17 +151,85 @@ impl<'db> Method<'db> {
 
         let mut dependencies = Dependencies::default();
 
-        let raw_params = Self::prepare_raw_params(&md, td, cache, &mut dependencies)?;
-
         let (td_namespace, td_name) = td.namespace_name_pair();
         let is_mutating = MUTATING_METHODS.binary_search(&(td_namespace, td_name, &raw_name)).is_ok();
+
+        // These `GetMany` methods have special semantics, since it takes an array and returns the number of elements that were filled
+        // It uses the __RPC__out_ecount_part(capacity, *actual) annotation in the C headers. For the wrapper we use a &mut Vec<> buffer.
+        let is_get_many = raw_name == "GetMany" && td_namespace == "Windows.Foundation.Collections" &&
+                            (td_name == "IVectorView`1" || td_name == "IIterator`1" || td_name == "IVector`1");
+
+        let mut input = Vec::new();
+        let mut output = Vec::new();
+        let mut get_many_pname = if is_get_many { Some(String::new()) } else { None };
+
+        let raw_params = Self::prepare_params(&md, td, cache, &mut dependencies, &mut input, &mut output, &mut get_many_pname)?;
+
+        let out_types = if is_get_many {
+            Vec::new()
+        } else {
+            output.iter().map(|(_, ty)| {
+                match is_return_type_nonnull(&ty) {
+                    Ok(nonnull) => Ok((ty, nonnull)),
+                    Err(e) => Err(e)
+                }
+            }).collect::<Result<Vec<_>>>()?
+        };
+
+        let mut return_type = String::new();
+        if out_types.len() != 1 {
+            return_type.push('('); // open tuple
+        }
+
+        let mut first = true;
+
+        for (ty, nonnull) in &out_types {
+            if !first {
+                return_type.push_str(", ");
+            } else {
+                first = false;
+            }
+            return_type.push_str(&types::get_type_name(ty, if *nonnull || kind == InterfaceKind::Factory { TypeUsage::OutNonNull } else { TypeUsage::Out }, &mut dependencies, Some(td))?);
+        }
+
+        if out_types.len() != 1 {
+            return_type.push(')'); // close tuple
+        }
+
+        let mut input_params = String::new();
+        for (pname, ty, kind) in &input {
+            input_params.push_str(", ");
+            input_params.push_str(pname);
+            input_params.push_str(": ");
+            match kind {
+                InputKind::Default => input_params.push_str(&types::get_type_name(ty, TypeUsage::In, &mut dependencies, Some(td))?),
+                InputKind::Raw => input_params.push_str(&types::get_type_name(ty, TypeUsage::Raw, &mut dependencies, Some(td))?),
+                InputKind::Slice => {
+                    input_params.push_str("&[");
+                    input_params.push_str(&types::get_type_name(ty, TypeUsage::In, &mut dependencies, Some(td))?);
+                    input_params.push(']');
+                },
+                InputKind::MutSlice => {
+                    //Assert(t.IsValueType);
+                    input_params.push_str("&mut [");
+                    input_params.push_str(&types::get_type_name(ty, TypeUsage::In, &mut dependencies, Some(td))?);
+                    input_params.push(']');
+                },
+                InputKind::VecBuffer => {
+                    input_params.push_str("&mut Vec<");
+                    input_params.push_str(&types::get_type_name(ty, TypeUsage::OutNonNull, &mut dependencies, Some(td))?);
+                    input_params.push('>');
+                }
+            }
+        }
 
         Ok(Method {
             md: md,
             dependencies: dependencies,
             raw_name: raw_name,
             raw_params: raw_params,
-            wrapped_name: String::new(),
+            return_type: return_type,
+            input_params: input_params,
             is_mutating: is_mutating,
         })
     }
@@ -136,7 +238,15 @@ impl<'db> Method<'db> {
         &self.dependencies
     }
 
-    fn prepare_raw_params<'c: 'db>(md: &MethodDef<'db>, td: &TypeDef<'db>, cache: &'c climeta::Cache<'c>, dependencies: &mut Dependencies) -> Result<String> {
+    fn prepare_params<'c: 'db>(
+        md: &MethodDef<'db>,
+        td: &TypeDef<'db>,
+        cache: &'c climeta::Cache<'c>,
+        dependencies: &mut Dependencies,
+        input: &mut Vec<(String, Type<'db>, InputKind)>,
+        output: &mut Vec<(String, Type<'db>)>,
+        get_many_pname: &mut Option<String>,
+    ) -> Result<String> {
         let mut result = String::new();
 
         let sig = md.signature()?;
@@ -161,7 +271,7 @@ impl<'db> Method<'db> {
             };
 
             result.push_str(", ");
-            let param_name = {
+            let mut param_name = {
                 let tmp = mpar.name()?;
                 let first = tmp.chars().nth(0).expect("at least one character").to_ascii_lowercase();
                 Some(first).into_iter().chain(tmp.chars().skip(1)).collect::<String>()
@@ -177,10 +287,32 @@ impl<'db> Method<'db> {
                 result.push_str(&param_name);
                 result.push_str("Size: *mut u32, ");
             }
-            result.push_str(&prevent_keywords(&param_name));
+
+            prevent_keywords_buf(&mut param_name);
+            result.push_str(&param_name);
             result.push_str(": ");
             match mpar_t.kind() {
-                schema::ParamKind::Type(ty) => result.push_str(&types::get_type_name(ty, TypeUsage::Raw, dependencies, Some(td))?),
+                schema::ParamKind::Type(ty) => {
+                    result.push_str(&types::get_type_name(ty, TypeUsage::Raw, dependencies, Some(td))?);
+
+                    match ty {
+                        Type::Array(array) => {
+                            // TODO: could handle Windows.Foundation.Metadata.RangeAttribute and Windows.Foundation.Metadata.LengthIsAttribute
+                            if mpar.flags()?.out() {
+                                if let Some(ref mut get_many_pname) = get_many_pname {
+                                    assert!(get_many_pname.is_empty());
+                                    std::mem::replace(get_many_pname, param_name.clone());
+                                    input.push((param_name, array.elem_type().clone(), InputKind::VecBuffer));
+                                } else {
+                                    input.push((param_name, array.elem_type().clone(), InputKind::MutSlice));
+                                }
+                            } else {
+                                input.push((param_name, array.elem_type().clone(), InputKind::Slice));
+                            }
+                        },
+                        _ => input.push((param_name, ty.clone(), InputKind::Default))
+                    }
+                },
                 schema::ParamKind::TypeByRef(ty) => {
                     let mut has_const_modifier = false;
                     for cmod in mpar_t.custom_mod() {
@@ -193,7 +325,8 @@ impl<'db> Method<'db> {
                             unimplemented!()
                         }
                     }
-                    result.push_str(&types::get_type_name_by_ref(ty, TypeUsage::Raw, dependencies, Some(td), has_const_modifier)?)
+                    result.push_str(&types::get_type_name_by_ref(ty, TypeUsage::Raw, dependencies, Some(td), has_const_modifier)?);
+                    output.push((param_name, ty.clone()));
                 },
                 _ => unimplemented!()
             }
@@ -207,6 +340,9 @@ impl<'db> Method<'db> {
                 }
                 result.push_str(", out: *mut ");
                 result.push_str(&types::get_type_name(ty, TypeUsage::Raw, dependencies, Some(td))?);
+
+                // this makes the actual return value the last in the tuple (if multiple)
+                output.push(("out".to_string(), ty.clone()))
             },
             _ => unimplemented!()
         }
@@ -260,17 +396,19 @@ impl<'db> Method<'db> {
         write!(file, "{}", indentation)?;
 
         let self_arg = if self.is_mutating { "&mut self" } else { "&self" };
-        // TODO: remaining parameters and return type
         let condition = self.dependencies.make_feature_condition(&self.md);
         if !condition.is_empty() {
             condition.emit_attribute(file)?;
             write!(file, " ")?;
         }
-        writeln!(file, "#[inline] pub fn {wrapper_name}({self_arg} /*TODO: ARGS*/) -> Result</*TODO: OUT*/> {{ unsafe {{",
+        writeln!(file, "#[inline] pub fn {wrapper_name}({self_arg}{input_params}) -> Result<{return_type}> {{ unsafe {{",
             wrapper_name = wrapper_name,
-            self_arg = self_arg
+            self_arg = self_arg,
+            input_params = self.input_params,
+            return_type = self.return_type
         )?;
         // TODO: wrapper body
+        writeln!(file, "{}    unimplemented!()", indentation)?;
         writeln!(file, "{}}}}}", indentation)?;
         Ok(())
     }

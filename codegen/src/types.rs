@@ -137,7 +137,7 @@ pub enum TyDef<'db> {
     Dummy
 }
 
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum InterfaceKind {
     Factory,
     Statics,
@@ -288,7 +288,7 @@ impl<'db> TyDef<'db> {
                     if md.name().expect("method without name") == ".ctor" {
                         None
                     } else {
-                        let m = methods::Method::new(md, &td, cache);
+                        let m = methods::Method::new(md, &td, cache, kind.unwrap());
                         let m = m.and_then(|meth| {
                             deps_ref.extend(meth.dependencies());
                             Ok(meth)
