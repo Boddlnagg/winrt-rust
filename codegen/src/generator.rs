@@ -77,7 +77,7 @@ impl<'db> Generator<'db> {
                     TypeCategory::Enum => TyDef::prepare_enum(t),
                     TypeCategory::Struct => TyDef::prepare_struct(t),
                     TypeCategory::Interface => TyDef::prepare_interface(t),
-                    TypeCategory::Delegate => TyDef::dummy(),
+                    TypeCategory::Delegate => TyDef::prepare_delegate(t),
                     TypeCategory::Class => TyDef::dummy()
                 }?;
 

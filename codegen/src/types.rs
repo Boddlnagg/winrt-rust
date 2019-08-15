@@ -141,7 +141,8 @@ pub enum TyDef<'db> {
 pub enum InterfaceKind {
     Factory,
     Statics,
-    Instance
+    Instance,
+    Delegate,
 }
 
 fn get_interface_kind<'db, 'c: 'db>(cache: &'c climeta::Cache<'c>, td: &TypeDef<'db>, exclusive_to_type: Option<TypeDef<'db>>) -> Result<InterfaceKind> {
@@ -227,6 +228,10 @@ impl<'db> TyDef<'db> {
         Ok(TyDef::Interface(ty, None, String::new(), Vec::new()))
     }
 
+    pub fn prepare_delegate(ty: TypeDef<'db>) -> Result<TyDef<'db>> {
+        Ok(TyDef::Interface(ty, Some(InterfaceKind::Delegate), String::new(), Vec::new()))
+    }
+
     pub fn can_be_skipped(&self) -> bool {
         match self {
             TyDef::Enum(_) => false,
@@ -250,17 +255,19 @@ impl<'db> TyDef<'db> {
                 std::mem::replace(prepared, result);
             },
             TyDef::Interface(td, ref mut kind, ref mut guid, ref mut methods) => {
-                let exclusive_to = td.get_attribute("Windows.Foundation.Metadata", "ExclusiveToAttribute")?;
-                let exclusive_to_type = if let Some(ex) = exclusive_to {
-                    let sig = ex.value(cache)?;
-                    match sig.fixed_args() {
-                        &[schema::FixedArg::Elem(schema::Elem::SystemType(typename))] => Some(typename.resolve(cache).expect("ExclusiveTo type not found")),
-                        _ => return Err("invalid signature for ExclusiveToAttribute".into())
-                    }
-                } else {
-                    None
-                };
-                kind.replace(get_interface_kind(cache, td, exclusive_to_type)?);
+                if kind.is_none() {
+                    let exclusive_to = td.get_attribute("Windows.Foundation.Metadata", "ExclusiveToAttribute")?;
+                    let exclusive_to_type = if let Some(ex) = exclusive_to {
+                        let sig = ex.value(cache)?;
+                        match sig.fixed_args() {
+                            &[schema::FixedArg::Elem(schema::Elem::SystemType(typename))] => Some(typename.resolve(cache).expect("ExclusiveTo type not found")),
+                            _ => return Err("invalid signature for ExclusiveToAttribute".into())
+                        }
+                    } else {
+                        None
+                    };
+                    kind.replace(get_interface_kind(cache, td, exclusive_to_type)?);
+                }
                 //println!("Interface {} is of kind {:?}", td.definition_name()?, kind);
 
                 // read GUID
@@ -365,14 +372,22 @@ impl<'db> TyDef<'db> {
                 };
 
                 writeln!(file, "\nDEFINE_IID!(IID_{name}, {guid});", name = definition_name, guid = guid)?;
-                writeln!(file, "RT_INTERFACE! {{ {prepend_static}interface {name}{generic}({name}Vtbl): IInspectable [IID_{name}] {{",
-                    prepend_static = match kind.as_ref().unwrap() {
-                        InterfaceKind::Factory | InterfaceKind::Statics => "static ",
-                        InterfaceKind::Instance => ""
-                    },
-                    name = definition_name,
-                    generic = generic
-                )?;
+                if kind.as_ref().unwrap() == &InterfaceKind::Delegate {
+                    writeln!(file, "RT_DELEGATE! {{ delegate {name}{generic}({name}Vtbl, {name}Impl): [IID_{name}] {{",
+                        name = definition_name,
+                        generic = generic
+                    )?;
+                } else {
+                    writeln!(file, "RT_INTERFACE! {{ {prepend_static}interface {name}{generic}({name}Vtbl): IInspectable [IID_{name}] {{",
+                        prepend_static = match kind.as_ref().unwrap() {
+                            InterfaceKind::Factory | InterfaceKind::Statics => "static ",
+                            InterfaceKind::Instance => "",
+                            InterfaceKind::Delegate => unreachable!()
+                        },
+                        name = definition_name,
+                        generic = generic
+                    )?;
+                }
                 for (i, meth) in methods.iter().enumerate() {
                     meth.emit_raw_declaration("    ", i, file)?;
                     let comma = if i == methods.len() - 1 { "" } else { "," };
