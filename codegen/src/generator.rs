@@ -78,10 +78,10 @@ impl<'db> Generator<'db> {
                     TypeCategory::Struct => TyDef::prepare_struct(t),
                     TypeCategory::Interface => TyDef::prepare_interface(t),
                     TypeCategory::Delegate => TyDef::prepare_delegate(t),
-                    TypeCategory::Class => TyDef::dummy()
+                    TypeCategory::Class => TyDef::prepare_class(t)
                 }?;
 
-                if !typedef.can_be_skipped() {
+                if !typedef.can_be_skipped()? {
                     all_definitions.insert(fullname, typedef);
                 }
             }

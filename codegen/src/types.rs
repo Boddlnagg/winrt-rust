@@ -2,8 +2,8 @@ use std::io::Write;
 use std::collections::HashSet;
 
 use climeta::{ResolveToTypeDef, AssemblyAccess};
-use climeta::schema::{self, TypeDef, TypeRef, Type, TypeTag, PrimitiveType, FieldInit, PrimitiveValue};
 
+use climeta::schema::{self, TypeDef, TypeRef, TypeDefOrRef, Type, TypeSpecSig, TypeTag, PrimitiveType, FieldInit, PrimitiveValue};
 use crate::Result;
 use crate::methods;
 use crate::generator::prevent_keywords;
@@ -38,7 +38,7 @@ impl Dependencies {
                 Some(_) => r.assembly_name().expect("TypeRef without assembly name"),
                 None => unimplemented!()
             },
-            _ => unimplemented!()
+            TypeSpec(s) => unimplemented!()
         };
         
         if !self.assemblies.contains(name) {
@@ -134,7 +134,7 @@ pub enum TyDef<'db> {
     Enum(TypeDef<'db>),
     Struct(TypeDef<'db>, String),
     Interface(TypeDef<'db>, Option<InterfaceKind>, String, Vec<methods::Method<'db>>),
-    Dummy
+    Class(TypeDef<'db>, String, bool)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -196,7 +196,7 @@ fn get_factory_types<'db, 'c: 'db, 'r>(td: &'r TypeDef<'db>, cache: &'c climeta:
         let sig: climeta::schema::CustomAttributeSig<'r> = attr.value(cache).expect("Error reading value of ActivatableAttribute");
         match &sig.fixed_args()[0] {
             schema::FixedArg::Elem(schema::Elem::SystemType(typename)) => Some(typename.namespace_name_pair()),
-            _ => None
+            _ => None // default activatable (not via factory)
         }
     }))
 }
@@ -213,6 +213,32 @@ fn get_static_types<'db, 'c: 'db, 'r>(td: &'r TypeDef<'db>, cache: &'c climeta::
             _ => unreachable!()
         }
     }))
+}
+
+fn get_default_interface<'db, 'r>(td: &'r TypeDef<'db>) -> Result<Option<TypeDefOrRef<'db>>> {
+    for intf in td.interface_impls()? {
+        if let Some(_) = intf.get_attribute("Windows.Foundation.Metadata", "DefaultAttribute")? {
+            return Ok(Some(intf.interface()?));
+        }
+    }
+
+    Ok(None)
+}
+
+fn is_default_activatable<'db, 'c: 'db>(td: &TypeDef<'db>, cache: &'c climeta::Cache<'c>) -> Result<bool> {
+    let attributes_count = td.custom_attributes()?.filter(move |attr| {
+        if attr.namespace_name_pair() != ("Windows.Foundation.Metadata", "ActivatableAttribute") {
+            return false;
+        }
+        let sig = attr.value(cache).expect("Error reading value of ActivatableAttribute");
+        match &sig.fixed_args()[0] {
+            schema::FixedArg::Elem(schema::Elem::SystemType(typename)) => false,
+            _ => true // not a factory type -> default activatable
+        }
+    }).count();
+
+    assert!(attributes_count <= 1); // make sure that our attribute filtering logic makes sense
+    Ok(attributes_count != 0)
 }
 
 impl<'db> TyDef<'db> {
@@ -232,13 +258,19 @@ impl<'db> TyDef<'db> {
         Ok(TyDef::Interface(ty, Some(InterfaceKind::Delegate), String::new(), Vec::new()))
     }
 
-    pub fn can_be_skipped(&self) -> bool {
-        match self {
+    pub fn prepare_class(ty: TypeDef<'db>) -> Result<TyDef<'db>> {
+        Ok(TyDef::Class(ty, String::new(), false))
+    }
+
+    pub fn can_be_skipped(&self) -> Result<bool> {
+        Ok(match self {
             TyDef::Enum(_) => false,
             TyDef::Struct(td, _) => td.field_list().unwrap().next().is_none(),
             TyDef::Interface(..) => false,
-            TyDef::Dummy => true
-        }
+            TyDef::Class(td, ..) => td.interface_impls()?.next().is_none() && !td.custom_attributes()?.any(move |attr| {
+                attr.namespace_name_pair() == ("Windows.Foundation.Metadata", "StaticAttribute")
+            })
+        })
     }
 
     pub fn collect_dependencies<'c: 'db>(&mut self, cache: &'c climeta::Cache<'c>) -> Result<Dependencies> {
@@ -305,7 +337,22 @@ impl<'db> TyDef<'db> {
                  }).collect::<Result<Vec<_>>>()?);
 
             },
-            TyDef::Dummy => {}
+            TyDef::Class(td, ref mut aliased_type, ref mut default_activatable) => {
+                if td.interface_impls()?.next().is_some() {
+                    let default_intf = get_default_interface(td)?.expect("class must have a default interface");
+                    let default_intf_ref = if let TypeDefOrRef::TypeSpec(s) = default_intf {
+                        match s.signature()? {
+                            TypeSpecSig::GenericInst(tag, def_or_ref, params) => {
+                                Type::Ref(tag, def_or_ref, Some(params))
+                            }
+                        }
+                    } else {
+                        Type::Ref(TypeTag::Class, default_intf, None)
+                    };
+                    aliased_type.push_str(&get_type_name(&default_intf_ref, TypeUsage::Alias, &mut deps, Some(&td))?);
+                    *default_activatable = is_default_activatable(td, cache)?;
+                }
+            }
         }
 
         Ok(deps)
@@ -409,13 +456,58 @@ impl<'db> TyDef<'db> {
                     writeln!(file, "}}")?
                 }
             }
-            TyDef::Dummy => {}
+            TyDef::Class(td, aliased_type, default_activatable) => {
+                let definition_name = td.definition_name()?;
+                let mut need_class_id = false;
+
+                if td.interface_impls()?.next().is_some() {
+                    // TODO: feature flags (inherit from IInspectable in the negative case)
+                    writeln!(file, "RT_CLASS! {{ class {name}: {aliased_type} }}",
+                        name = definition_name,
+                        aliased_type = aliased_type
+                    )?;
+
+                    // TODO: emit impl blocks for factories
+                } else {
+                    writeln!(file, "RT_CLASS! {{ static class {name} }}",
+                        name = definition_name
+                    )?;
+                }
+
+                // TODO: emit impl blocks for statics
+
+                if *default_activatable {
+                    need_class_id = true;
+                    writeln!(file, "impl RtActivatable<IActivationFactory> for {name} {{}}",
+                        name = definition_name
+                    )?;
+                }
+
+                // TODO: emit method wrappers
+
+                if (need_class_id) {
+                    
+                    write!(file, "DEFINE_CLSID!({}(&[", definition_name)?;
+                    let (type_ns, type_name) = td.namespace_name_pair();
+                    let mut first = true;
+                    for c in type_ns.encode_utf16() {
+                        if first {
+                            write!(file, "{}", c as i32)?;
+                            first = false;
+                        } else {
+                            write!(file, ",{}", c)?;
+                        }
+                    }
+                    write!(file, ",{}", b'.' as u16)?; // the dot that separates namespace and name
+                    for c in type_name.encode_utf16() {
+                        write!(file, ",{}", c)?;
+                    }
+                    // include a null terminator
+                    write!(file, ",0]) [CLSID_{}]);", definition_name)?;
+                }
+            }
         }
         Ok(())
-    }
-
-    pub fn dummy() -> Result<TyDef<'db>> {
-        Ok(TyDef::Dummy)
     }
 }
 
@@ -475,6 +567,7 @@ pub fn get_type_name(ty: &Type, usage: TypeUsage, deps: &mut Dependencies, gener
         }
         Type::Ref(tag, def_or_ref, generic_args) => {
             deps.add_type(def_or_ref);
+            // TODO: maybe also call add_type for generic_args?
             let fullname = def_or_ref.namespace_name_pair();
             if fullname == ("System", "Guid") {
                 assert!(*tag == TypeTag::ValueType);
@@ -512,7 +605,7 @@ pub fn get_type_name(ty: &Type, usage: TypeUsage, deps: &mut Dependencies, gener
                     (TypeTag::Class, TypeUsage::Out) => format!("Option<{}>", path),
                     (TypeTag::Class, TypeUsage::OutNonNull) => path,
                     (TypeTag::Class, TypeUsage::GenericArg) => path,
-                    _ => unimplemented!()
+                    (TypeTag::Class, TypeUsage::Alias) => path,
                 }
             }
         },
