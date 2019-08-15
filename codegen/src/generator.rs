@@ -40,6 +40,18 @@ fn next_from_namespace<'db>(definitions: &mut Vec<(FullName<'db>, TyDef<'db>)>, 
     }
 }
 
+fn get_sort_key_ignoring_interface_prefix<'a>(input: (&'a str, &'a str)) -> (&'a str, &'a str, u8) {
+    let (input_ns, input_type) = input;
+    let mut chars = input_type.chars();
+    if (chars.next() == Some('I') && chars.next().map(|c| c.is_uppercase()) == Some(true)) {
+        let mut chars2 = input_type.chars();
+        chars2.next();
+        (input_ns, chars2.as_str(), 0)
+    } else {
+        (input_ns, input_type, 1)
+    }
+}
+
 impl<'db> Generator<'db> {
     pub fn new(cache: &'db Cache<'db>) -> Result<Generator<'db>> {
         let mut all_definitions = HashMap::new();
@@ -124,7 +136,7 @@ impl<'db> Generator<'db> {
     pub fn write_module_tree_multifile_root(&mut self, directory: &Path) -> Result<()> {
         let all_definitions = std::mem::replace(&mut self.all_definitions, HashMap::new());
         let mut definitions_vec: Vec<_> = all_definitions.into_iter().map(|(k, v)| (k, v)).collect();
-        definitions_vec.sort_by(|a, b| b.0.cmp(&a.0));
+        definitions_vec.sort_by(|a, b| get_sort_key_ignoring_interface_prefix(b.0).cmp(&get_sort_key_ignoring_interface_prefix(a.0)));
 
         let mut pathbuf: PathBuf = directory.into();
         pathbuf.push("mod.rs");
