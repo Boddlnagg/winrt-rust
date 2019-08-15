@@ -438,5 +438,7 @@ mod tests {
         assert_eq!(camel_to_snake_case("ExecuteJavaScript"), "execute_javascript");
         assert_eq!(camel_to_snake_case("IsIndexedDBEnabled"), "is_indexeddb_enabled");
         assert_eq!(camel_to_snake_case("get_3DCoordinates"), "get_3d_coordinates");
+        assert_eq!(camel_to_snake_case("1Example"), "1_example");
+        assert_eq!(camel_to_snake_case("3DExample"), "3d_example");
     }
 }
