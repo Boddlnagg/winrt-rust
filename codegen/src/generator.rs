@@ -42,6 +42,11 @@ fn next_from_namespace<'db>(definitions: &mut Vec<(FullName<'db>, TyDef<'db>)>, 
 
 fn get_sort_key_ignoring_interface_prefix<'a>(input: (&'a str, &'a str)) -> (&'a str, &'a str, u8) {
     let (input_ns, input_type) = input;
+    let input_type = match input_type.find('`') {
+        None => input_type,
+        Some(i) => &input_type[..i]
+    };
+
     let mut chars = input_type.chars();
     if (chars.next() == Some('I') && chars.next().map(|c| c.is_uppercase()) == Some(true)) {
         let mut chars2 = input_type.chars();
@@ -50,6 +55,10 @@ fn get_sort_key_ignoring_interface_prefix<'a>(input: (&'a str, &'a str)) -> (&'a
     } else {
         (input_ns, input_type, 1)
     }
+}
+
+fn sort_reverse_ignoring_interface_prefix<'a, T>(slice: &mut [(FullName<'a>, T)]) {
+    slice.sort_by(|a, b| get_sort_key_ignoring_interface_prefix(b.0).cmp(&get_sort_key_ignoring_interface_prefix(a.0)));
 }
 
 impl<'db> Generator<'db> {
@@ -136,7 +145,7 @@ impl<'db> Generator<'db> {
     pub fn write_module_tree_multifile_root(&mut self, directory: &Path) -> Result<()> {
         let all_definitions = std::mem::replace(&mut self.all_definitions, HashMap::new());
         let mut definitions_vec: Vec<_> = all_definitions.into_iter().map(|(k, v)| (k, v)).collect();
-        definitions_vec.sort_by(|a, b| get_sort_key_ignoring_interface_prefix(b.0).cmp(&get_sort_key_ignoring_interface_prefix(a.0)));
+        sort_reverse_ignoring_interface_prefix(&mut definitions_vec);
 
         let mut pathbuf: PathBuf = directory.into();
         pathbuf.push("mod.rs");
