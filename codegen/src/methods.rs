@@ -128,6 +128,58 @@ enum InputKind {
     VecBuffer,
 }
 
+pub trait MethodRawName {
+    fn raw_name(&self) -> &str;
+
+    fn get_wrapper_name<T: MethodRawName>(&self, methods: &[T], result: &mut String) {
+        let name_without_put: Cow<str> = if self.raw_name().starts_with("put_") {
+            Cow::from(self.raw_name().replacen("put_", "set_", 1))
+        } else {
+            Cow::from(self.raw_name())
+        };
+
+        camel_to_snake_case(&name_without_put, result);
+
+        prevent_keywords_buf(result);
+
+        // name already contains '_' -> might result in a name clash after renaming, e.g. caused by
+        // original names `get_Text` (property getter) and `GetText` (method)
+        if self.raw_name().contains('_') {
+            let mut result2 = String::new();
+            let conflict = methods
+                            .iter()
+                            .filter(|elem| !elem.raw_name().contains('_'))
+                            .any(|elem| {
+                                elem.get_wrapper_name(methods, &mut result2);
+                                &result2 == result
+                            });
+            if conflict {
+                result.push('_');
+            }
+        }
+    }
+}
+
+pub struct ClassMethod<'db> {
+    wrapped: Method<'db>
+}
+
+impl<'db> MethodRawName for ClassMethod<'db> {
+    fn raw_name(&self) -> &str {
+        &self.wrapped.raw_name
+    }
+}
+
+impl<'db> ClassMethod<'db> {
+    pub fn new<'c: 'db>(md: MethodDef<'db>, td: &TypeDef<'db>, cache: &'c climeta::Cache<'c>, is_factory: bool) -> Result<ClassMethod<'db>> {
+        Ok(ClassMethod { wrapped: Method::new(md, td, cache, is_factory)? })
+    }
+
+    pub fn emit<W: Write>(&self, indentation: &str, clsname: &str, wrapper_name: &str, file: &mut W) -> Result<()> {
+        self.wrapped.emit_class_wrapper(indentation, clsname, wrapper_name, file)
+    }
+}
+
 pub struct Method<'db> {
     md: MethodDef<'db>,
     dependencies: Dependencies,
@@ -138,8 +190,14 @@ pub struct Method<'db> {
     is_mutating: bool,
 }
 
+impl<'db> MethodRawName for Method<'db> {
+    fn raw_name(&self) -> &str {
+        &self.raw_name
+    }
+}
+
 impl<'db> Method<'db> {
-    pub fn new<'c: 'db>(md: MethodDef<'db>, td: &TypeDef<'db>, cache: &'c climeta::Cache<'c>, kind: InterfaceKind) -> Result<Method<'db>> {
+    pub fn new<'c: 'db>(md: MethodDef<'db>, td: &TypeDef<'db>, cache: &'c climeta::Cache<'c>, is_factory: bool) -> Result<Method<'db>> {
         let raw_name = if let Some(overload) = md.get_attribute("Windows.Foundation.Metadata", "OverloadAttribute")? {
             match overload.value(cache)?.fixed_args() {
                 &[schema::FixedArg::Elem(schema::Elem::String(Some(name)))] => name.to_string(),
@@ -163,6 +221,7 @@ impl<'db> Method<'db> {
         let mut output = Vec::new();
         let mut get_many_pname = if is_get_many { Some(String::new()) } else { None };
 
+        // TODO: this is only partially necessary for ClassMethod -> factor it out
         let raw_params = Self::prepare_params(&md, td, cache, &mut dependencies, &mut input, &mut output, &mut get_many_pname)?;
 
         let out_types = if is_get_many {
@@ -189,7 +248,7 @@ impl<'db> Method<'db> {
             } else {
                 first = false;
             }
-            return_type.push_str(&types::get_type_name(ty, if *nonnull || kind == InterfaceKind::Factory { TypeUsage::OutNonNull } else { TypeUsage::Out }, &mut dependencies, Some(td))?);
+            return_type.push_str(&types::get_type_name(ty, if *nonnull || is_factory { TypeUsage::OutNonNull } else { TypeUsage::Out }, &mut dependencies, Some(td))?);
         }
 
         if out_types.len() != 1 {
@@ -364,34 +423,6 @@ impl<'db> Method<'db> {
         Ok(())
     }
 
-    pub fn get_wrapper_name(&self, methods: &[Method], result: &mut String) {
-        let name_without_put: Cow<str> = if self.raw_name.starts_with("put_") {
-            Cow::from(self.raw_name.replacen("put_", "set_", 1))
-        } else {
-            Cow::from(&self.raw_name)
-        };
-
-        camel_to_snake_case(&name_without_put, result);
-
-        prevent_keywords_buf(result);
-
-        // name already contains '_' -> might result in a name clash after renaming, e.g. caused by
-        // original names `get_Text` (property getter) and `GetText` (method)
-        if self.raw_name.contains('_') {
-            let mut result2 = String::new();
-            let conflict = methods
-                            .iter()
-                            .filter(|elem| !elem.raw_name.contains('_'))
-                            .any(|elem| {
-                                elem.get_wrapper_name(methods, &mut result2);
-                                &result2 == result
-                            });
-            if conflict {
-                result.push('_');
-            }
-        }
-    }
-
     pub fn emit_wrapper<W: Write>(&self, indentation: &str, wrapper_name: &str, file: &mut W) -> Result<()> {
         write!(file, "{}", indentation)?;
 
@@ -410,6 +441,24 @@ impl<'db> Method<'db> {
         // TODO: wrapper body
         writeln!(file, "{}    unimplemented!()", indentation)?;
         writeln!(file, "{}}}}}", indentation)?;
+        Ok(())
+    }
+
+    fn emit_class_wrapper<W: Write>(&self, indentation: &str, clsname: &str, wrapper_name: &str, file: &mut W) -> Result<()> {
+        // TODO: feature flags
+        writeln!(file, "{indent}#[inline] pub fn {visible_name}({input_params}) -> Result<{return_type}> {{",
+            indent = indentation,
+            visible_name = "NAME",
+            input_params = "/*TODO*/",
+            return_type = "/*TODO*/"
+        )?;
+        writeln!(file, "{indent}    <Self as RtActivatable<{declaring_type}>>::get_activation_factory().{wrapper_name}({input_params})",
+            indent = indentation,
+            declaring_type = clsname,
+            wrapper_name = wrapper_name,
+            input_params = "/*TODO*/"
+        )?;
+        writeln!(file, "{}}}", indentation)?;
         Ok(())
     }
 }

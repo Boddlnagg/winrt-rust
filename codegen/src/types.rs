@@ -5,8 +5,17 @@ use climeta::{ResolveToTypeDef, AssemblyAccess};
 
 use climeta::schema::{self, TypeDef, TypeRef, TypeDefOrRef, Type, TypeSpecSig, TypeTag, PrimitiveType, FieldInit, PrimitiveValue};
 use crate::Result;
-use crate::methods;
+use crate::methods::{self, MethodRawName};
 use crate::generator::prevent_keywords;
+
+// work around the limitations of `sort_by_key` ...
+fn my_sort_by_key_ref<T, B, F>(this: &mut [T], mut f: F)
+where
+    F: FnMut(&T) -> &B,
+    B: Ord,
+{
+    this.sort_by(|a, b| f(a).cmp(f(b)))
+}
 
 trait TypeDefExt<'db> {
     /// Type name without the marker for generic types
@@ -129,12 +138,11 @@ impl FeatureCondition {
     }
 }
 
-#[derive(Debug)]
 pub enum TyDef<'db> {
     Enum(TypeDef<'db>),
     Struct(TypeDef<'db>, String),
     Interface(TypeDef<'db>, Option<InterfaceKind>, String, Vec<methods::Method<'db>>),
-    Class(TypeDef<'db>, String, bool)
+    Class(TypeDef<'db>, String, bool, Vec<(String, Vec<methods::ClassMethod<'db>>)>, Vec<(String, Vec<methods::ClassMethod<'db>>)>)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -146,6 +154,8 @@ pub enum InterfaceKind {
 }
 
 fn get_interface_kind<'db, 'c: 'db>(cache: &'c climeta::Cache<'c>, td: &TypeDef<'db>, exclusive_to_type: Option<TypeDef<'db>>) -> Result<InterfaceKind> {
+    // To get this absolutely right, we would need to search through *every* TypeDef and look for ocurrences of
+    // `StaticAttribute` and `FactoryAttribute`, so we use a heuristic instead.
     let trimmed_name = td.type_name()?.trim_end_matches(&['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'][..]);
     let guessed_from_name = trimmed_name.ends_with("Factory") || trimmed_name.ends_with("Statics");
     let mut candidates: [Option<TypeDef>; 3] = [None, None, None];
@@ -259,7 +269,7 @@ impl<'db> TyDef<'db> {
     }
 
     pub fn prepare_class(ty: TypeDef<'db>) -> Result<TyDef<'db>> {
-        Ok(TyDef::Class(ty, String::new(), false))
+        Ok(TyDef::Class(ty, String::new(), false, Vec::new(), Vec::new()))
     }
 
     pub fn can_be_skipped(&self) -> Result<bool> {
@@ -327,7 +337,7 @@ impl<'db> TyDef<'db> {
                     if md.name().expect("method without name") == ".ctor" {
                         None
                     } else {
-                        let m = methods::Method::new(md, &td, cache, kind.unwrap());
+                        let m = methods::Method::new(md, &td, cache, kind.unwrap() == InterfaceKind::Factory);
                         let m = m.and_then(|meth| {
                             deps_ref.extend(meth.dependencies());
                             Ok(meth)
@@ -337,7 +347,7 @@ impl<'db> TyDef<'db> {
                  }).collect::<Result<Vec<_>>>()?);
 
             },
-            TyDef::Class(td, ref mut aliased_type, ref mut default_activatable) => {
+            TyDef::Class(td, ref mut aliased_type, ref mut default_activatable, ref mut statics, ref mut factories) => {
                 if td.interface_impls()?.next().is_some() {
                     let default_intf = get_default_interface(td)?.expect("class must have a default interface");
                     let default_intf_ref = if let TypeDefOrRef::TypeSpec(s) = default_intf {
@@ -352,6 +362,64 @@ impl<'db> TyDef<'db> {
                     aliased_type.push_str(&get_type_name(&default_intf_ref, TypeUsage::Alias, &mut deps, Some(&td))?);
                     *default_activatable = is_default_activatable(td, cache)?;
                 }
+
+                let td: &TypeDef<'db> = td;
+
+                // TODO: should use `get_static_types` instead of that inline `filter_map`, but the lifetimes don't work ...
+                for stc in td.custom_attributes()?.filter_map(move |attr| {
+                    if attr.namespace_name_pair() != ("Windows.Foundation.Metadata", "StaticAttribute") {
+                        return None;
+                    }
+                    let sig = attr.value(cache).expect("Error reading value of StaticAttribute");
+                    match &sig.fixed_args()[0] {
+                        schema::FixedArg::Elem(schema::Elem::SystemType(typename)) => Some(typename.namespace_name_pair()),
+                        _ => unreachable!()
+                    }
+                }) {
+                    let static_td: TypeDef<'db> = stc.resolve(cache).expect("Static type must be resolvable");
+                    let mut static_methods = Vec::new();
+                    for md in static_td.method_list()? {
+                        if md.name()? != ".ctor" {
+                            let m = methods::ClassMethod::new(md, &static_td, cache, false)?;
+                            //deps_ref.extend(m.dependencies());
+                            static_methods.push(m);
+                        }
+                    }
+                    let static_ref = TypeDefOrRef::TypeDef(static_td);
+                    deps.add_type(&static_ref);
+                    let static_ty = Type::Ref(TypeTag::Class, static_ref, None);
+                    statics.push((get_type_name(&static_ty, TypeUsage::Alias, &mut deps, Some(&td))?, static_methods));
+                }
+                my_sort_by_key_ref(&mut statics[..], |&(ref name, _)| name); // sort by class name
+
+                // TODO: should use `get_factory_types` instead of that inline `filter_map`, but the lifetimes don't work ...
+                for fct in td.custom_attributes()?.filter_map(move |attr| {
+                    if attr.namespace_name_pair() != ("Windows.Foundation.Metadata", "ActivatableAttribute") {
+                        return None;
+                    }
+                    let sig = attr.value(cache).expect("Error reading value of ActivatableAttribute");
+                    match &sig.fixed_args()[0] {
+                        schema::FixedArg::Elem(schema::Elem::SystemType(typename)) => Some(typename.namespace_name_pair()),
+                        _ => None // default activatable (not via factory)
+                    }
+                }) {
+                    let factory_td = fct.resolve(cache).expect("Factory type must be resolvable");
+                    let mut factory_methods = Vec::new();
+                    for md in factory_td.method_list()? {
+                        if md.name()? != ".ctor" {
+                            let m = methods::ClassMethod::new(md, &factory_td, cache, false)?;
+                            //deps_ref.extend(m.dependencies());
+                            factory_methods.push(m);
+                        }
+                    }
+                    let factory_ref = TypeDefOrRef::TypeDef(factory_td);
+                    deps.add_type(&factory_ref);
+                    let factory_ty = Type::Ref(TypeTag::Class, factory_ref, None);
+                    factories.push((get_type_name(&factory_ty, TypeUsage::Alias, &mut deps, Some(&td))?, factory_methods));
+                }
+                my_sort_by_key_ref(&mut factories[..], |&(ref name, _)| name); // sort by class name
+
+                // TODO: fix name clashes in method wrappers (caused by overloads from different interfaces)
             }
         }
 
@@ -456,7 +524,7 @@ impl<'db> TyDef<'db> {
                     writeln!(file, "}}")?
                 }
             }
-            TyDef::Class(td, aliased_type, default_activatable) => {
+            TyDef::Class(td, aliased_type, default_activatable, statics, factories) => {
                 let definition_name = td.definition_name()?;
                 let mut need_class_id = false;
 
@@ -467,14 +535,26 @@ impl<'db> TyDef<'db> {
                         aliased_type = aliased_type
                     )?;
 
-                    // TODO: emit impl blocks for factories
+                    for (fct, _) in factories {
+                        need_class_id = true;
+                        writeln!(file, "impl RtActivatable<{factory_name}> for {name} {{}}",
+                            name = definition_name,
+                            factory_name = fct
+                        )?;
+                    }
                 } else {
                     writeln!(file, "RT_CLASS! {{ static class {name} }}",
                         name = definition_name
                     )?;
                 }
 
-                // TODO: emit impl blocks for statics
+                for (stc, _) in statics {
+                    need_class_id = true;
+                    writeln!(file, "impl RtActivatable<{static_name}> for {name} {{}}",
+                        name = definition_name,
+                        static_name = stc
+                    )?;
+                }
 
                 if *default_activatable {
                     need_class_id = true;
@@ -483,10 +563,19 @@ impl<'db> TyDef<'db> {
                     )?;
                 }
 
-                // TODO: emit method wrappers
+                if !statics.is_empty() || !factories.is_empty() {
+                    writeln!(file, "impl {name} {{", name = definition_name)?;
+                    let mut wrapper_name = String::new(); // can be reused
+                    for (clsname, methods) in factories.iter().chain(statics.iter()) {
+                        for m in methods {
+                            m.get_wrapper_name(methods, &mut wrapper_name);
+                            m.emit("    ", clsname, &wrapper_name, file)?;
+                        }
+                    }
+                    writeln!(file, "}}")?;
+                }
 
-                if (need_class_id) {
-                    
+                if need_class_id {
                     write!(file, "DEFINE_CLSID!({}(&[", definition_name)?;
                     let (type_ns, type_name) = td.namespace_name_pair();
                     let mut first = true;
